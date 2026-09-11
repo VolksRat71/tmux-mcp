@@ -195,3 +195,21 @@ def test_server_instructions_state_the_protocol():
 ])
 def test_split_keys_only_splits_sequences_of_key_names(keys, expected):
     assert server._split_keys(keys) == expected
+
+
+# --- regressions found in live smoke testing -----------------------------------
+
+def test_lines_limits_the_pane_tail():
+    for i in range(6):
+        server.tmux_run(f"echo line-{i}", TARGET)
+    out = server.tmux_read_pane(TARGET, lines=2)
+    body = out.splitlines()[1:]
+    assert len(body) == 2
+    assert "line-5" in out
+    assert "line-3" not in out
+
+
+def test_run_from_idle_shell_does_not_warn_about_stdin():
+    out = server.tmux_run("sleep 30", TARGET, timeout=1)
+    assert "still running" in out.splitlines()[0]
+    assert "not a shell" not in out

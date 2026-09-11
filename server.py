@@ -96,7 +96,12 @@ def _capture(target: str, lines: int) -> str:
     cmd = ["capture-pane", "-p", "-S", str(-lines)]
     if target:
         cmd += ["-t", target]
-    return _run(cmd).rstrip("\n")
+    out = _run(cmd).rstrip("\n")
+    if out.startswith("ERROR"):
+        return out
+    # capture-pane returns the visible screen plus `lines` of history;
+    # keep only the last `lines` lines so the tail is what the name says.
+    return "\n".join(out.split("\n")[-lines:])
 
 
 _NAMED_KEYS = {
@@ -142,20 +147,26 @@ def _header(target: str, *parts: str) -> str:
     return "[{}]".format(" | ".join([label, f"foreground: {fg} ({state})", *parts]))
 
 
-def _busy_note(target: str) -> str:
-    fg = _foreground(target)
-    if fg in _SHELLS:
+def _busy_note(fg_before: str) -> str:
+    """Warn when text was typed into a pane whose foreground was not a shell."""
+    if not fg_before or fg_before in _SHELLS:
         return ""
     return (
-        f"NOTE: foreground is '{fg}', not a shell - the text went to that "
-        "program's stdin. Use tmux_send_keys C-c to interrupt it if that was "
-        "not intended."
+        f"NOTE: foreground was '{fg_before}', not a shell - the text went to "
+        "that program's stdin. Use tmux_send_keys C-c to interrupt it if that "
+        "was not intended."
     )
 
 
-def _report(target: str, lines: int, *parts: str) -> str:
+def _report(target: str, lines: int, *parts: str, fg_before: str = "") -> str:
+    """Header + optional stdin warning + pane tail.
+
+    fg_before is the foreground command as it was before a send; pass it
+    from any tool that typed something so the warning reflects where the
+    text actually went, not what the shell launched afterwards.
+    """
     chunks = [_header(target, *parts)]
-    note = _busy_note(target)
+    note = _busy_note(fg_before)
     if note:
         chunks.append(note)
     chunks.append(_capture(target, lines))
@@ -281,6 +292,7 @@ def tmux_run(command: str, target: str, timeout: int = 30, lines: int = 50,
         if refusal:
             return refusal
     timeout = min(max(timeout, 1), 600)
+    fg_before = _foreground(target)
     err = _send(target, command, literal=True)
     if err.startswith("ERROR"):
         return err
@@ -289,7 +301,7 @@ def tmux_run(command: str, target: str, timeout: int = 30, lines: int = 50,
     outcome, elapsed = _wait(target, timeout)
     status = (f"finished in {elapsed:.1f}s" if outcome == "idle"
               else f"still running after {elapsed:.1f}s (timeout)")
-    return _report(target, lines, "sent + Enter", status)
+    return _report(target, lines, "sent + Enter", status, fg_before=fg_before)
 
 
 @mcp.tool()
@@ -316,6 +328,7 @@ def tmux_send_text(text: str, target: str, enter: bool = True, lines: int = 30,
         refusal = _duplicate_refusal(target, text, lines)
         if refusal:
             return refusal
+    fg_before = _foreground(target)
     err = _send(target, text, literal=True)
     if err.startswith("ERROR"):
         return err
@@ -323,7 +336,8 @@ def tmux_send_text(text: str, target: str, enter: bool = True, lines: int = 30,
         _send(target, "Enter")
         _record_send(target, text)
     time.sleep(_SETTLE)
-    return _report(target, lines, "sent + Enter" if enter else "typed, not submitted")
+    return _report(target, lines, "sent + Enter" if enter else "typed, not submitted",
+                   fg_before=fg_before)
 
 
 @mcp.tool()
