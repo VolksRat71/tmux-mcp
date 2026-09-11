@@ -1,28 +1,219 @@
 """
-tmux-mcp — MCP server for interacting with tmux sessions.
+tmux-mcp - MCP server for driving tmux panes from an agent.
 
-Tools for listing sessions/panes, reading pane content, sending keys,
-and waiting for output changes.
+Design rules (they exist because agents kept tripping on the old version):
+
+* Anything that types into a pane EXECUTES immediately when Enter is
+  pressed, so every send returns evidence: a status header plus the pane
+  tail, never a bare "Keys sent.".
+* ``tmux_run`` is the primary tool. It types a command, presses Enter, and
+  waits until the shell is idle again (or a timeout), so one call replaces
+  the send / sleep / read dance.
+* Waits are real waits. They poll and return as soon as the pane is idle
+  or the expected text shows up, and the header says which happened.
+* Re-sending the same text to a pane that is still busy is refused unless
+  ``force=True``; the usual cause is an agent thinking a command did not
+  run because the output had not arrived yet.
+* ``target`` is required on every tool that types. tmux's "current pane"
+  may be the agent's own pane.
 """
 
+import os
 import subprocess
 import time
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("tmux")
+INSTRUCTIONS = """\
+tmux protocol for agents:
+- Sending keys EXECUTES immediately when Enter is pressed. One send = one run.
+- To run a shell command, call tmux_run. It types the command, presses Enter,
+  waits until the shell is idle or the timeout passes, and returns the output.
+  Do not follow it with a separate Enter or a read; the result is already there.
+- Every send returns a header like
+  [target | foreground: bash (idle) | sent + Enter | finished in 0.6s]
+  followed by the pane tail. Read the header before deciding anything.
+- If the header says "still running", the command has NOT failed. Call
+  tmux_wait_and_read on the same target. NEVER resend a command because its
+  output looked empty or the prompt had not come back yet.
+- "foreground: X (busy)" where X is not a shell means the pane is running a
+  program; typed text goes to that program's stdin, not to a shell.
+- tmux_send_keys is for control keys (C-c, Escape, Up, Tab). It does not press
+  Enter unless enter=True. tmux_send_text is for typing into an interactive
+  program (a REPL, a prompt).
+- target is required on anything that types. Find one with tmux_list_panes.
+"""
 
+mcp = FastMCP("tmux", instructions=INSTRUCTIONS)
+
+# Set TMUX_MCP_SOCKET to talk to a private tmux server (tests use this).
+_SOCKET = os.environ.get("TMUX_MCP_SOCKET", "")
+
+_SHELLS = {"bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh"}
+_POLL = 0.25          # seconds between polls while waiting
+_SETTLE = 0.4         # seconds to let a send land before capturing
+_MIN_WAIT = 0.3       # let the shell fork before judging it idle
+_DUPLICATE_WINDOW = 15.0  # seconds within which an identical send is suspect
+
+# pane_id -> (text, monotonic time) of the last executed send
+_send_history: dict[str, tuple[str, float]] = {}
+
+
+# --- tmux plumbing -----------------------------------------------------------
 
 def _run(cmd: list[str], timeout: int = 10) -> str:
-    """Run a tmux command and return stdout."""
+    """Run a tmux command and return stdout, or an ERROR: line."""
+    base = ["tmux", "-L", _SOCKET] if _SOCKET else ["tmux"]
     result = subprocess.run(
-        ["tmux"] + cmd,
-        capture_output=True, text=True, timeout=timeout
+        base + cmd, capture_output=True, text=True, timeout=timeout
     )
     if result.returncode != 0 and result.stderr:
         return "ERROR: {}".format(result.stderr.strip())
     return result.stdout
 
+
+def _display(target: str, fmt: str) -> str:
+    cmd = ["display-message", "-p"]
+    if target:
+        cmd += ["-t", target]
+    return _run(cmd + [fmt]).strip()
+
+
+def _pane_id(target: str) -> str:
+    return _display(target, "#{pane_id}")
+
+
+def _foreground(target: str) -> str:
+    """Name of the process in the foreground of the pane (bash, node, ...)."""
+    return _display(target, "#{pane_current_command}")
+
+
+def _is_idle(target: str) -> bool:
+    return _foreground(target) in _SHELLS
+
+
+def _capture(target: str, lines: int) -> str:
+    cmd = ["capture-pane", "-p", "-S", str(-lines)]
+    if target:
+        cmd += ["-t", target]
+    return _run(cmd).rstrip("\n")
+
+
+_NAMED_KEYS = {
+    "enter", "escape", "space", "tab", "btab", "bspace", "up", "down", "left",
+    "right", "home", "end", "pageup", "pagedown", "ppage", "npage", "ic", "dc",
+    *{f"f{i}" for i in range(1, 13)},
+}
+
+
+def _is_key_name(token: str) -> bool:
+    lowered = token.lower()
+    if lowered in _NAMED_KEYS:
+        return True
+    # Modifier chords: C-c, M-x, C-M-Left, S-Tab, ...
+    if "-" in token and len(token) > 2:
+        *mods, base = token.split("-")
+        return all(m in ("C", "M", "S") for m in mods) and (
+            len(base) == 1 or base.lower() in _NAMED_KEYS)
+    return False
+
+
+def _split_keys(keys: str) -> list[str]:
+    """Split "Up Up Enter" into separate key args; leave plain text intact."""
+    tokens = keys.split(" ")
+    if len(tokens) > 1 and all(_is_key_name(t) for t in tokens):
+        return tokens
+    return [keys]
+
+
+def _send(target: str, *keys: str, literal: bool = False) -> str:
+    cmd = ["send-keys", "-t", target]
+    if literal:
+        cmd.append("-l")
+    return _run(cmd + list(keys))
+
+
+# --- result formatting -------------------------------------------------------
+
+def _header(target: str, *parts: str) -> str:
+    fg = _foreground(target)
+    state = "idle" if fg in _SHELLS else "busy"
+    label = target or _pane_id("")
+    return "[{}]".format(" | ".join([label, f"foreground: {fg} ({state})", *parts]))
+
+
+def _busy_note(target: str) -> str:
+    fg = _foreground(target)
+    if fg in _SHELLS:
+        return ""
+    return (
+        f"NOTE: foreground is '{fg}', not a shell - the text went to that "
+        "program's stdin. Use tmux_send_keys C-c to interrupt it if that was "
+        "not intended."
+    )
+
+
+def _report(target: str, lines: int, *parts: str) -> str:
+    chunks = [_header(target, *parts)]
+    note = _busy_note(target)
+    if note:
+        chunks.append(note)
+    chunks.append(_capture(target, lines))
+    return "\n".join(chunks)
+
+
+def _wait(target: str, timeout: float, until_text: str = "") -> tuple[str, float]:
+    """Poll until the pane is idle+quiet, until_text appears, or timeout.
+
+    Returns (outcome, elapsed) where outcome is 'idle', 'matched', or 'timeout'.
+    """
+    start = time.monotonic()
+    time.sleep(min(_MIN_WAIT, timeout))
+    previous = None
+    while True:
+        content = _capture(target, 200)
+        elapsed = time.monotonic() - start
+        if until_text and until_text in content:
+            return "matched", elapsed
+        if _is_idle(target) and content == previous:
+            return "idle", elapsed
+        if elapsed >= timeout:
+            return "timeout", elapsed
+        previous = content
+        time.sleep(min(_POLL, max(timeout - elapsed, 0.01)))
+
+
+# --- duplicate guard -----------------------------------------------------------
+
+def _reset_send_history() -> None:
+    _send_history.clear()
+
+
+def _duplicate_refusal(target: str, text: str, lines: int) -> str:
+    """Return a refusal message if this exact text was just sent to a busy pane."""
+    pane = _pane_id(target)
+    last = _send_history.get(pane)
+    if not last:
+        return ""
+    last_text, last_at = last
+    age = time.monotonic() - last_at
+    if last_text != text or age > _DUPLICATE_WINDOW or _is_idle(target):
+        return ""
+    return "\n".join([
+        _header(target, "REFUSED duplicate send"),
+        f"The identical text was sent to this pane {age:.1f}s ago and the pane "
+        "is still busy, so it was NOT sent again. The earlier command is "
+        "probably still running: call tmux_wait_and_read on this target. "
+        "If you really do want it sent twice, pass force=True.",
+        _capture(target, lines),
+    ])
+
+
+def _record_send(target: str, text: str) -> None:
+    _send_history[_pane_id(target)] = (text, time.monotonic())
+
+
+# --- tools: discovery and reading --------------------------------------------
 
 @mcp.tool()
 def tmux_list_sessions() -> str:
@@ -32,11 +223,13 @@ def tmux_list_sessions() -> str:
 
 @mcp.tool()
 def tmux_list_panes(session: str = "") -> str:
-    """List all panes in a session (or all sessions if empty).
+    """List panes (all sessions if session is empty). Use this to pick a target.
 
-    Returns pane index, size, current command, and pane ID for each.
+    Each line: target  size  foreground-command  pane-id. Pass the target
+    (e.g. "setup:0.0") or the pane id (e.g. "%3") to the other tools.
     """
-    fmt = "#{session_name}:#{window_index}.#{pane_index}  #{pane_width}x#{pane_height}  #{pane_current_command}  #{pane_id}"
+    fmt = ("#{session_name}:#{window_index}.#{pane_index}  "
+           "#{pane_width}x#{pane_height}  #{pane_current_command}  #{pane_id}")
     if session:
         return _run(["list-panes", "-t", session, "-F", fmt])
     return _run(["list-panes", "-a", "-F", fmt])
@@ -44,97 +237,167 @@ def tmux_list_panes(session: str = "") -> str:
 
 @mcp.tool()
 def tmux_read_pane(target: str = "", lines: int = 50) -> str:
-    """Capture visible content from a tmux pane.
+    """Read a pane right now, without waiting. Read-only.
+
+    Prefer tmux_wait_and_read when a command may still be running: this
+    tool returns whatever is on screen this instant, which is often just
+    the echoed command line.
 
     Args:
-        target: Pane target (e.g. "setup:0.0"). Empty = current pane.
-        lines: Number of lines to capture from the bottom (default 50).
+        target: Pane target (e.g. "setup:0.0"). Empty = tmux's current pane.
+        lines: Lines to capture from the bottom (default 50).
     """
-    cmd = ["capture-pane", "-p", "-S", str(-lines)]
-    if target:
-        cmd += ["-t", target]
-    return _run(cmd)
+    return _report(target, lines, "snapshot")
+
+
+# --- tools: running and typing -----------------------------------------------
+
+@mcp.tool()
+def tmux_run(command: str, target: str, timeout: int = 30, lines: int = 50,
+             force: bool = False) -> str:
+    """Run a shell command in a pane and return its output. USE THIS FIRST.
+
+    Types the command literally, presses Enter, then waits until the shell
+    prompt is back and the screen has stopped changing, or until `timeout`
+    seconds pass. One call = one execution; do not follow it with Enter or
+    a separate read.
+
+    The first line of the result is a status header ending in either
+    "finished in Ns" or "still running after Ns". "still running" is not a
+    failure: call tmux_wait_and_read on the same target to keep waiting.
+
+    Refuses to send the identical command to a pane that is still busy from
+    the previous send unless force=True.
+
+    Args:
+        command: Shell command, taken literally (no tmux key-name parsing).
+        target: Pane target (e.g. "setup:0.0" or "%3"). Required.
+        timeout: Max seconds to wait for the prompt to return (default 30, max 600).
+        lines: Lines of pane tail to return (default 50).
+        force: Send even if it duplicates a send still in flight.
+    """
+    if not force:
+        refusal = _duplicate_refusal(target, command, lines)
+        if refusal:
+            return refusal
+    timeout = min(max(timeout, 1), 600)
+    err = _send(target, command, literal=True)
+    if err.startswith("ERROR"):
+        return err
+    _send(target, "Enter")
+    _record_send(target, command)
+    outcome, elapsed = _wait(target, timeout)
+    status = (f"finished in {elapsed:.1f}s" if outcome == "idle"
+              else f"still running after {elapsed:.1f}s (timeout)")
+    return _report(target, lines, "sent + Enter", status)
 
 
 @mcp.tool()
-def tmux_send_keys(keys: str, target: str = "", enter: bool = True) -> str:
-    """Send keystrokes to a tmux pane.
+def tmux_send_text(text: str, target: str, enter: bool = True, lines: int = 30,
+                   force: bool = False) -> str:
+    """Type literal text into a pane, for interactive programs (REPL, prompt).
+
+    Enter is pressed by default, so the text is SUBMITTED immediately. For
+    shell commands use tmux_run instead; it also waits for the result.
+    Returns a status header and the pane tail after a short settle. When the
+    header says the foreground is not a shell, the text went to that program.
+
+    Refuses to resubmit identical text to a pane that is still busy from the
+    previous send unless force=True.
 
     Args:
-        keys: The text or key names to send.
-        target: Pane target (e.g. "setup:0.0"). Empty = current pane.
-        enter: Whether to send Enter after the keys (default True).
+        text: Literal text; tmux key names are NOT interpreted.
+        target: Pane target (e.g. "setup:0.0" or "%3"). Required.
+        enter: Press Enter after the text (default True).
+        lines: Lines of pane tail to return (default 30).
+        force: Send even if it duplicates a send still in flight.
     """
-    cmd = ["send-keys", "-t", target, keys] if target else ["send-keys", keys]
-    result = _run(cmd)
+    if enter and not force:
+        refusal = _duplicate_refusal(target, text, lines)
+        if refusal:
+            return refusal
+    err = _send(target, text, literal=True)
+    if err.startswith("ERROR"):
+        return err
     if enter:
-        enter_cmd = ["send-keys", "-t", target, "Enter"] if target else ["send-keys", "Enter"]
-        _run(enter_cmd)
-    return result or "Keys sent."
+        _send(target, "Enter")
+        _record_send(target, text)
+    time.sleep(_SETTLE)
+    return _report(target, lines, "sent + Enter" if enter else "typed, not submitted")
 
 
 @mcp.tool()
-def tmux_send_text(text: str, target: str = "") -> str:
-    """Send literal text to a tmux pane (no interpretation of special keys).
+def tmux_send_keys(keys: str, target: str, enter: bool = False, lines: int = 30) -> str:
+    """Send tmux key names to a pane: C-c, Escape, Up, Tab, Enter, and so on.
 
-    Use this for sending prompts or commands that might contain special characters.
+    Does NOT press Enter unless enter=True. For shell commands use tmux_run;
+    for typing text into a program use tmux_send_text.
+    Returns a status header and the pane tail after a short settle.
 
     Args:
-        text: Literal text to type.
-        target: Pane target (e.g. "setup:0.0"). Empty = current pane.
+        keys: Space-separated tmux key names or text (e.g. "C-c", "Escape", "Up Up").
+        target: Pane target (e.g. "setup:0.0" or "%3"). Required.
+        enter: Also press Enter afterwards (default False).
+        lines: Lines of pane tail to return (default 30).
     """
-    cmd = ["send-keys", "-l"]
-    if target:
-        cmd += ["-t", target]
-    cmd.append(text)
-    _run(cmd)
-    # Send enter separately
-    enter_cmd = ["send-keys"]
-    if target:
-        enter_cmd += ["-t", target]
-    enter_cmd.append("Enter")
-    _run(enter_cmd)
-    return "Text sent."
+    err = _send(target, *_split_keys(keys))
+    if err.startswith("ERROR"):
+        return err
+    if enter:
+        _send(target, "Enter")
+        _record_send(target, keys)
+    time.sleep(_SETTLE)
+    what = f"sent: {keys}" + (" + Enter" if enter else "")
+    return _report(target, lines, what)
 
 
 @mcp.tool()
-def tmux_wait_and_read(target: str = "", seconds: int = 5, lines: int = 50) -> str:
-    """Wait for a specified duration then capture pane content.
+def tmux_wait_and_read(target: str = "", seconds: int = 30, lines: int = 50,
+                       until_text: str = "") -> str:
+    """Wait for a pane to finish, then read it. Returns as soon as it can.
 
-    Useful for sending a command and then reading the result after it completes.
+    Polls the pane and returns when the shell prompt is back and the screen
+    has stopped changing ("idle"), when `until_text` appears ("matched"), or
+    when `seconds` have passed ("timed out"). The header says which.
+    Use this after tmux_run reports "still running", or after typing into a
+    program that takes a while. Never resend a command instead of waiting.
 
     Args:
-        target: Pane target (e.g. "setup:0.0"). Empty = current pane.
-        seconds: How long to wait before reading (default 5, max 120).
-        lines: Number of lines to capture (default 50).
+        target: Pane target (e.g. "setup:0.0"). Empty = tmux's current pane.
+        seconds: Upper bound on the wait (default 30, max 600).
+        lines: Lines of pane tail to return (default 50).
+        until_text: Return early once this text is visible in the pane.
     """
-    seconds = min(max(seconds, 1), 120)
-    time.sleep(seconds)
-    cmd = ["capture-pane", "-p", "-S", str(-lines)]
-    if target:
-        cmd += ["-t", target]
-    return _run(cmd)
+    seconds = min(max(seconds, 1), 600)
+    outcome, elapsed = _wait(target, seconds, until_text)
+    if outcome == "matched":
+        status = f"matched {until_text!r} after {elapsed:.1f}s"
+    elif outcome == "idle":
+        status = f"idle after {elapsed:.1f}s"
+    else:
+        status = f"timed out after {elapsed:.1f}s, still busy"
+    return _report(target, lines, status)
 
+
+# --- tools: pane management ------------------------------------------------------
 
 @mcp.tool()
 def tmux_new_pane(target: str = "", vertical: bool = False, command: str = "") -> str:
-    """Split a pane to create a new one.
+    """Split a pane to create a new one. Returns the new pane's target and id.
 
     Args:
         target: Pane to split (e.g. "setup:0.0"). Empty = current pane.
         vertical: If True, split vertically. Default is horizontal.
         command: Optional command to run in the new pane.
     """
-    cmd = ["split-window"]
-    if vertical:
-        cmd.append("-v")
-    else:
-        cmd.append("-h")
+    cmd = ["split-window", "-v" if vertical else "-h", "-P",
+           "-F", "#{session_name}:#{window_index}.#{pane_index}  #{pane_id}"]
     if target:
         cmd += ["-t", target]
     if command:
         cmd.append(command)
-    return _run(cmd) or "Pane created."
+    out = _run(cmd).strip()
+    return f"Pane created: {out}" if out and not out.startswith("ERROR") else out
 
 
 @mcp.tool()
