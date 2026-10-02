@@ -5,7 +5,9 @@ here can reach the user's real sessions.
 """
 
 import inspect
+import dataclasses
 import os
+import shlex
 import subprocess
 import time
 
@@ -213,3 +215,73 @@ def test_run_from_idle_shell_does_not_warn_about_stdin():
     out = server.tmux_run("sleep 30", TARGET, timeout=1)
     assert "still running" in out.splitlines()[0]
     assert "not a shell" not in out
+
+
+def fake_agent(monkeypatch, tmp_path, draft, clear_after=0):
+    """Real PTY input, with only the fake process's identity adapted."""
+    receipt = tmp_path / "received"
+    script = tmp_path / "fake_tui.py"
+    script.write_text(
+        "import os, sys, time, tty\n"
+        "tty.setraw(0)\n"
+        "def render(text):\n"
+        "    sys.stdout.write('\\x1b[2J\\x1b[H• Done.\\r\\n› ' + text + '\\x1b[2;3H')\n"
+        "    sys.stdout.flush()\n"
+        f"render({draft!r})\n"
+        + (f"time.sleep({clear_after}); render('Ask Codex to do anything')\n" if clear_after else "")
+        + f"open({str(receipt)!r}, 'wb').write(os.read(0, 4096))\n"
+        "time.sleep(10)\n"
+    )
+    tmux("set-option", "-p", "-t", TARGET, "@mcp_agent_kind", "codex")
+    tmux("send-keys", "-t", TARGET, "-l", f"{shlex.quote(os.sys.executable)} {shlex.quote(str(script))}")
+    tmux("send-keys", "-t", TARGET, "Enter")
+    time.sleep(.3)
+    real_snapshot = server.guard.snapshot
+    monkeypatch.setattr(server.guard, "snapshot", lambda target:
+                        dataclasses.replace(real_snapshot(target), foreground="codex"))
+    monkeypatch.setattr(server.guard, "STATE_DIR", tmp_path / "guard-state")
+    return receipt
+
+
+def test_live_draft_never_receives_peer_input(monkeypatch, tmp_path):
+    receipt = fake_agent(monkeypatch, tmp_path, "Re")
+    result = server.tmux_message("From Codex: hello", TARGET, wait_seconds=1)
+    assert "NOT SENT" in result and "draft" in result
+    assert not receipt.exists() or receipt.read_bytes() == b""
+
+
+def test_live_send_waits_until_human_draft_clears(monkeypatch, tmp_path):
+    receipt = fake_agent(monkeypatch, tmp_path, "Nate's answer", clear_after=1.2)
+    start = time.monotonic()
+    result = server.tmux_message("From Claude: hello", TARGET, wait_seconds=5)
+    assert "delivered" in result
+    assert time.monotonic() - start >= 1
+    time.sleep(.1)
+    assert b"From Claude: hello" in receipt.read_bytes()
+
+
+@pytest.mark.parametrize("tool", ["text", "keys", "run"])
+def test_all_legacy_send_paths_respect_guard_even_force(monkeypatch, tmp_path, tool):
+    receipt = fake_agent(monkeypatch, tmp_path, "Re")
+    real_send = server.guard.send
+    monkeypatch.setattr(server.guard, "send", lambda *args, **kw: real_send(*args, **kw, wait_seconds=0))
+    if tool == "text":
+        result = server.tmux_send_text("peer", TARGET, force=True)
+    elif tool == "keys":
+        result = server.tmux_send_keys("Enter", TARGET)
+    else:
+        result = server.tmux_run("peer", TARGET, force=True)
+    assert "NOT SENT" in result
+    assert not receipt.exists() or receipt.read_bytes() == b""
+
+
+def test_real_question_hook_latches_and_matches_completion(monkeypatch, tmp_path):
+    import guard_hook
+    monkeypatch.setenv("TMUX_PANE", tmux("display-message", "-p", "-t", TARGET, "#{pane_id}").strip())
+    monkeypatch.setattr(server.guard, "STATE_DIR", tmp_path)
+    guard_hook.handle({"hook_event_name": "PreToolUse", "tool_name": "request_user_input", "tool_use_id": "q1"})
+    assert server.guard.snapshot(TARGET).question == "request_user_input:q1"
+    guard_hook.handle({"hook_event_name": "PostToolUse", "tool_name": "request_user_input", "tool_use_id": "old"})
+    assert server.guard.snapshot(TARGET).question == "request_user_input:q1"
+    guard_hook.handle({"hook_event_name": "PostToolUse", "tool_name": "request_user_input", "tool_use_id": "q1"})
+    assert server.guard.snapshot(TARGET).question == ""

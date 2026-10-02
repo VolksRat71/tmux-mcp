@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^(AskUserQuestion|request_user_input)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/tmux-mcp/guard_hook.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|exec|exec_command|shell|shell_command|AskUserQuestion|request_user_input|mcp__tmux__tmux_(send_keys|send_text|run))$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/tmux-mcp/guard_hook.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/tmux-mcp/guard_hook.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

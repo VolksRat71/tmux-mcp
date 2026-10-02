@@ -22,6 +22,8 @@ import os
 import subprocess
 import time
 
+import guard
+
 from mcp.server.fastmcp import FastMCP
 
 INSTRUCTIONS = """\
@@ -42,6 +44,9 @@ tmux protocol for agents:
   Enter unless enter=True. tmux_send_text is for typing into an interactive
   program (a REPL, a prompt).
 - target is required on anything that types. Find one with tmux_list_panes.
+- Peer Claude/Codex messages MUST use tmux_message. It automatically waits
+  for human typing, drafts and question dialogs to clear. NOT SENT means no
+  message was queued or submitted. Never bypass it with shell send-keys.
 """
 
 mcp = FastMCP("tmux", instructions=INSTRUCTIONS)
@@ -293,10 +298,9 @@ def tmux_run(command: str, target: str, timeout: int = 30, lines: int = 50,
             return refusal
     timeout = min(max(timeout, 1), 600)
     fg_before = _foreground(target)
-    err = _send(target, command, literal=True)
-    if err.startswith("ERROR"):
+    err = guard.send(target, [command], literal=True, enter=True)
+    if err:
         return err
-    _send(target, "Enter")
     _record_send(target, command)
     outcome, elapsed = _wait(target, timeout)
     status = (f"finished in {elapsed:.1f}s" if outcome == "idle"
@@ -329,11 +333,10 @@ def tmux_send_text(text: str, target: str, enter: bool = True, lines: int = 30,
         if refusal:
             return refusal
     fg_before = _foreground(target)
-    err = _send(target, text, literal=True)
-    if err.startswith("ERROR"):
+    err = guard.send(target, [text], literal=True, enter=enter)
+    if err:
         return err
     if enter:
-        _send(target, "Enter")
         _record_send(target, text)
     time.sleep(_SETTLE)
     return _report(target, lines, "sent + Enter" if enter else "typed, not submitted",
@@ -354,15 +357,38 @@ def tmux_send_keys(keys: str, target: str, enter: bool = False, lines: int = 30)
         enter: Also press Enter afterwards (default False).
         lines: Lines of pane tail to return (default 30).
     """
-    err = _send(target, *_split_keys(keys))
-    if err.startswith("ERROR"):
+    err = guard.send(target, _split_keys(keys), enter=enter)
+    if err:
         return err
     if enter:
-        _send(target, "Enter")
         _record_send(target, keys)
     time.sleep(_SETTLE)
     what = f"sent: {keys}" + (" + Enter" if enter else "")
     return _report(target, lines, what)
+
+
+@mcp.tool()
+def tmux_message(text: str, target: str, wait_seconds: int = 25) -> str:
+    """Deliver a peer message only when the Claude/Codex input is safe.
+
+    Waits for typing, unfinished drafts, questions and dialogs. Times out
+    without sending or retaining a message. Never answer a question meant
+    for the human. No force override exists. Use this instead of send-keys.
+    Prefix the text with your identity (for example 'From Codex: ...').
+    """
+    state = guard.snapshot(target)
+    if not state.kind:
+        return "NOT SENT: target is not a recognized Claude/Codex pane."
+    result = guard.send(state.pane, [text], literal=True, enter=True,
+                        wait_seconds=wait_seconds)
+    return result or _report(state.pane, 12, "peer message delivered")
+
+
+@mcp.tool()
+def tmux_input_status(target: str) -> str:
+    """Read why an agent pane is protected, without sending any input."""
+    state = guard.snapshot(target)
+    return f"[{state.pane} | {state.kind or 'other'} | {guard.block_reason(state) or 'ready'}]"
 
 
 @mcp.tool()
