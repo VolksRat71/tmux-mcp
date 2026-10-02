@@ -23,6 +23,7 @@ import subprocess
 import time
 
 import guard
+import delivery
 
 from mcp.server.fastmcp import FastMCP
 
@@ -44,9 +45,10 @@ tmux protocol for agents:
   Enter unless enter=True. tmux_send_text is for typing into an interactive
   program (a REPL, a prompt).
 - target is required on anything that types. Find one with tmux_list_panes.
-- Peer Claude/Codex messages MUST use tmux_message. It automatically waits
-  for human typing, drafts and question dialogs to clear. NOT SENT means no
-  message was queued or submitted. Never bypass it with shell send-keys.
+- Peer Claude/Codex messages MUST use tmux_message. It queues automatically
+  while human typing, drafts or questions block delivery. QUEUED means keep
+  working; do not resend. Use tmux_message_status to check delivery. Never
+  bypass the guard with shell send-keys.
 """
 
 mcp = FastMCP("tmux", instructions=INSTRUCTIONS)
@@ -371,17 +373,25 @@ def tmux_send_keys(keys: str, target: str, enter: bool = False, lines: int = 30)
 def tmux_message(text: str, target: str, wait_seconds: int = 25) -> str:
     """Deliver a peer message only when the Claude/Codex input is safe.
 
-    Waits for typing, unfinished drafts, questions and dialogs. Times out
-    without sending or retaining a message. Never answer a question meant
-    for the human. No force override exists. Use this instead of send-keys.
+    Waits for typing, unfinished drafts, questions and dialogs. If the initial
+    wait ends, returns QUEUED with an ID; delivery continues automatically for
+    up to one hour. Use tmux_message_status, not a resend. Never answer a
+    question meant for the human. No force override exists.
     Prefix the text with your identity (for example 'From Codex: ...').
     """
-    state = guard.snapshot(target)
-    if not state.kind:
-        return "NOT SENT: target is not a recognized Claude/Codex pane."
-    result = guard.send(state.pane, [text], literal=True, enter=True,
-                        wait_seconds=wait_seconds)
-    return result or _report(state.pane, 12, "peer message delivered")
+    return delivery.enqueue(target, text, wait_seconds)
+
+
+@mcp.tool()
+def tmux_message_status(message_id: str) -> str:
+    """Read a queued peer message's delivery status. Does not send input."""
+    return delivery.status(message_id)
+
+
+@mcp.tool()
+def tmux_cancel_message(message_id: str) -> str:
+    """Request cancellation of a queued message; check status for the outcome."""
+    return delivery.cancel(message_id)
 
 
 @mcp.tool()

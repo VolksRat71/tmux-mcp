@@ -7,8 +7,12 @@ import fcntl
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
+import shlex
+import subprocess
 import sys
+import time
 
 import guard
 
@@ -18,15 +22,108 @@ CLI = str(__file__).replace("guard_hook.py", "guard.py")
 GUIDANCE = (
     "Peer input is protected. Use tmux_message after reconnecting the tmux MCP. "
     "Until then write your message to a temporary UTF-8 file, then run: "
-    f"/usr/bin/python3 '{CLI}' TARGET --file /tmp/message.txt. "
+    f"/usr/bin/python3 '{CLI}' TARGET --file /tmp/message.txt --queue. "
     "The guard automatically waits for typing/drafts/questions to clear. "
-    "NOT SENT means nothing was queued. Never answer a human question or "
+    "QUEUED means delivery will continue automatically; do not resend. Never answer a human question or "
     "bypass this guard with raw tmux commands."
 )
 
 
 def is_agent(target):
     return bool(guard.snapshot(target).kind)
+
+
+def pane_session(pane):
+    """Identify the resumed TUI under this pane, not the shared app-server.
+
+    A managed Codex daemon can export the same TMUX_PANE to unrelated
+    sessions. Never use that variable alone as evidence of session ownership.
+    Unidentifiable/fresh sessions retain screen protection, without a latch.
+    """
+    root = int(guard.tmux("display-message", "-p", "-t", pane, "#{pane_pid}").strip())
+    result = subprocess.run(["ps", "-axo", "pid=,ppid=,command="],
+                            capture_output=True, text=True, timeout=3, check=True)
+    return session_from_processes(result.stdout, root)
+
+
+def session_from_processes(table, root):
+    processes = {}
+    for line in table.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3:
+            processes[int(parts[0])] = (int(parts[1]), parts[2])
+    descendants = {root}
+    while True:
+        expanded = descendants | {pid for pid, (parent, _) in processes.items() if parent in descendants}
+        if expanded == descendants:
+            break
+        descendants = expanded
+    sessions = set()
+    for pid in descendants:
+        command = processes.get(pid, (0, ""))[1]
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            continue
+        if not args or Path(args[0]).name not in {"codex", "claude"}:
+            continue
+        for i, arg in enumerate(args[:-1]):
+            if arg in {"resume", "--resume", "-r"} and re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", args[i+1]):
+                sessions.add(args[i+1])
+    return next(iter(sessions)) if len(sessions) == 1 else ""
+
+
+def owns_pane(payload):
+    pane = os.environ.get("TMUX_PANE")
+    session = payload.get("session_id")
+    return bool(pane and session and pane_session(pane) == session)
+
+
+def is_question_result(line, call_id):
+    try:
+        item = json.loads(line)
+        payload = item.get("payload", {})
+        return (item.get("type") == "response_item" and isinstance(payload, dict)
+                and payload.get("type") == "function_call_output"
+                and payload.get("call_id") == call_id)
+    except (ValueError, AttributeError):
+        return False
+
+
+def watch_result(pane, token, transcript, offset):
+    """Clear only on the exact terminal tool result, including error results.
+
+    No inactivity timeout releases a question. A replaced/cleared marker
+    ends this observer. Unknown transcript records do not release input.
+    """
+    call_id = token.split(":", 1)[1]
+    with open(transcript, encoding="utf-8") as stream:
+        stream.seek(offset)
+        pending = ""
+        while guard.snapshot(pane).question == token:
+            # Codex history files may be truncated during history maintenance.
+            if os.fstat(stream.fileno()).st_size < stream.tell():
+                stream.seek(0)
+                pending = ""
+            chunk = stream.read()
+            pending += chunk
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                if is_question_result(line, call_id):
+                    question_state(token, False)
+                    return
+            time.sleep(.25)
+
+
+def start_result_watch(token, transcript, offset):
+    guard.STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Keep errors visible without keeping the hook's stdout pipe open. This
+    # records diagnostics only, never question/answer content.
+    with (guard.STATE_DIR / "question-observer.log").open("a") as log:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--watch",
+                          os.environ["TMUX_PANE"], token, transcript, str(offset)],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         start_new_session=True, close_fds=True)
 
 
 def question_state(token, pending):
@@ -47,15 +144,28 @@ def question_state(token, pending):
 def handle(payload):
     event = payload.get("hook_event_name", "")
     tool = payload.get("tool_name", "").split(".")[-1]
-    if event == "SessionStart" and os.environ.get("TMUX_PANE"):
+    owned = owns_pane(payload) if event == "SessionStart" or tool in QUESTIONS else False
+    if event == "SessionStart" and owned:
         pane = os.environ["TMUX_PANE"]
         current = guard.snapshot(pane).question
         if current:
             question_state(current, False)
-    if tool in QUESTIONS:
+    if tool in QUESTIONS and owned:
         token = tool + ":" + payload.get("tool_use_id", "unknown")
         if event == "PreToolUse":
+            transcript = payload.get("transcript_path")
+            # Capture the offset before returning to the tool: its result may
+            # arrive before the detached observer has started.
+            if tool == "request_user_input" and not (transcript and Path(transcript).is_file()):
+                return {"systemMessage": "tmux question latch skipped: no Codex transcript; screen checks still apply."}
+            offset = Path(transcript).stat().st_size if tool == "request_user_input" else 0
             question_state(token, True)
+            if tool == "request_user_input":
+                try:
+                    start_result_watch(token, transcript, offset)
+                except OSError:
+                    question_state(token, False)  # The hook will deny this tool call.
+                    raise
         elif event in {"PostToolUse", "PostToolUseFailure"}:
             question_state(token, False)
     if event != "PreToolUse":
@@ -82,6 +192,11 @@ def handle(payload):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--watch":
+        pane, token, transcript, offset = sys.argv[2:]
+        os.environ["TMUX_PANE"] = pane
+        watch_result(pane, token, transcript, int(offset))
+        raise SystemExit(0)
     payload = {}
     try:
         payload = json.load(sys.stdin)

@@ -22,7 +22,8 @@ refused.
 
 | Tool | Use it for |
 |------|-----------|
-| `tmux_message(text, target, wait_seconds=25)` | Peer Claude/Codex messages. Automatically waits for a safe empty composer; never overrides human input. |
+| `tmux_message(text, target, wait_seconds=25)` | Peer Claude/Codex messages. Waits initially, then returns a queued ID while safe delivery continues automatically. |
+| `tmux_message_status(message_id)`, `tmux_cancel_message(message_id)` | Inspect or request cancellation of a queued peer message. |
 | `tmux_input_status(target)` | Read the reason a pane is protected. |
 | `tmux_run(command, target)` | **Start here.** Types a shell command, presses Enter, and polls until the shell prompt is back and the screen has stopped changing, or until `timeout` seconds. Returns a status header plus the pane tail. |
 | `tmux_wait_and_read(target, seconds, until_text)` | Wait for a pane to go idle, or for `until_text` to appear, with `seconds` as an upper bound. Returns as soon as either happens. |
@@ -63,7 +64,8 @@ Agent panes are detected by session/foreground name, or the pane option
 `@mcp_agent_kind` (`claude` / `codex`). All three legacy send tools also use
 the guard; `force` cannot bypass human input protection. The guard waits up
 to 25 seconds for a recognized empty composer, no question/dialog, three
-seconds without client activity, and one second of stable screen state. It
+seconds without client activity, and one second of stable input state. Unrelated
+progress output does not restart the stability timer. It
 rechecks under a shared per-pane process lock immediately before delivery.
 
 An unfinished draft stays protected regardless of how long the user pauses.
@@ -74,16 +76,29 @@ semantic certainty. The screen adapters currently recognize the observed
 Claude and Codex layouts and Codex's `Ask Codex to do anything` placeholder.
 Other placeholders/layouts may remain blocked until cleared or supported.
 
-`NOT SENT` means nothing is queued for later delivery. The caller can retry
-through the guard after the interaction completes. Recent identical agent
-messages are refused across processes for 15 seconds. Attempt fingerprints
-and locks live in the OS temp directory; message contents are not stored.
-An uncertain delivery error requires inspecting the pane before retrying.
+`tmux_message` retains the message in a private OS-temp queue if the initial
+wait expires, returning `QUEUED` and a message ID. A detached worker keeps
+checking through the same guard for up to one hour. It never sends on expiry.
+The caller should check status, not resend. Repeated pending submissions reuse
+the same job. Delivery stops if the pane or identified conversation changes.
+Cancellation is a request: check status to see whether delivery already occurred.
+Queued text is deleted from the job when it reaches a terminal state.
+
+The low-level send tools and plain `guard.py` remain synchronous: `NOT SENT`
+means nothing queued. Recent identical agent writes are refused across
+processes for 15 seconds. An uncertain delivery error is not retried automatically.
 
 `guard_hook.py` tracks `AskUserQuestion` (Claude) and `request_user_input`
 (Codex, when exposed through tool hooks), matching completion by tool-call
-ID. It needs `TMUX_PANE` in the hook environment. Screen detection still
-applies when hooks are absent. SessionStart clears a leftover question flag.
+ID. A hook must match its session ID to the resumed CLI process inside the
+pane; inherited `TMUX_PANE` alone is insufficient because Codex's shared daemon
+can pass it to other conversations. Unidentified fresh sessions retain screen
+protection without a hook latch. SessionStart only clears its own pane's flag.
+For Codex, an observer also watches for that exact call's terminal transcript
+result, including failures such as "unavailable in Default mode" which may
+skip PostToolUse. It never releases on inactivity or an unrelated call's result.
+Observer errors are logged in the private temp directory. This parser follows
+the locally verified Codex rollout format; unknown formats leave input protected.
 Async question tools are not latched using immediate PostToolUse completion.
 
 For Codex, merge [examples/codex-hooks.json](examples/codex-hooks.json) into
@@ -103,7 +118,7 @@ Until an MCP connection is reloaded, use the stdlib-only guarded CLI:
 
 ```sh
 /usr/bin/python3 /absolute/path/to/tmux-mcp/guard.py %7 --check
-/usr/bin/python3 /absolute/path/to/tmux-mcp/guard.py %7 --file /tmp/peer-message.txt
+/usr/bin/python3 /absolute/path/to/tmux-mcp/guard.py %7 --file /tmp/peer-message.txt --queue
 ```
 
 Write the exact message to the UTF-8 file using a file tool, avoiding shell

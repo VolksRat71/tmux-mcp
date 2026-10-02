@@ -6,6 +6,7 @@ here can reach the user's real sessions.
 
 import inspect
 import dataclasses
+import json
 import os
 import shlex
 import subprocess
@@ -245,7 +246,7 @@ def fake_agent(monkeypatch, tmp_path, draft, clear_after=0):
 
 def test_live_draft_never_receives_peer_input(monkeypatch, tmp_path):
     receipt = fake_agent(monkeypatch, tmp_path, "Re")
-    result = server.tmux_message("From Codex: hello", TARGET, wait_seconds=1)
+    result = server.guard.send(TARGET, ["From Codex: hello"], literal=True, enter=True, wait_seconds=1)
     assert "NOT SENT" in result and "draft" in result
     assert not receipt.exists() or receipt.read_bytes() == b""
 
@@ -253,8 +254,8 @@ def test_live_draft_never_receives_peer_input(monkeypatch, tmp_path):
 def test_live_send_waits_until_human_draft_clears(monkeypatch, tmp_path):
     receipt = fake_agent(monkeypatch, tmp_path, "Nate's answer", clear_after=1.2)
     start = time.monotonic()
-    result = server.tmux_message("From Claude: hello", TARGET, wait_seconds=5)
-    assert "delivered" in result
+    result = server.guard.send(TARGET, ["From Claude: hello"], literal=True, enter=True, wait_seconds=5)
+    assert result == ""
     assert time.monotonic() - start >= 1
     time.sleep(.1)
     assert b"From Claude: hello" in receipt.read_bytes()
@@ -277,11 +278,67 @@ def test_all_legacy_send_paths_respect_guard_even_force(monkeypatch, tmp_path, t
 
 def test_real_question_hook_latches_and_matches_completion(monkeypatch, tmp_path):
     import guard_hook
+    monkeypatch.setattr(guard_hook, "owns_pane", lambda payload: True)
     monkeypatch.setenv("TMUX_PANE", tmux("display-message", "-p", "-t", TARGET, "#{pane_id}").strip())
     monkeypatch.setattr(server.guard, "STATE_DIR", tmp_path)
-    guard_hook.handle({"hook_event_name": "PreToolUse", "tool_name": "request_user_input", "tool_use_id": "q1"})
-    assert server.guard.snapshot(TARGET).question == "request_user_input:q1"
-    guard_hook.handle({"hook_event_name": "PostToolUse", "tool_name": "request_user_input", "tool_use_id": "old"})
-    assert server.guard.snapshot(TARGET).question == "request_user_input:q1"
-    guard_hook.handle({"hook_event_name": "PostToolUse", "tool_name": "request_user_input", "tool_use_id": "q1"})
+    guard_hook.handle({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q1"})
+    assert server.guard.snapshot(TARGET).question == "AskUserQuestion:q1"
+    guard_hook.handle({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "old"})
+    assert server.guard.snapshot(TARGET).question == "AskUserQuestion:q1"
+    guard_hook.handle({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "q1"})
     assert server.guard.snapshot(TARGET).question == ""
+
+
+def test_detached_observer_clears_failed_question_on_private_pane(monkeypatch, tmp_path):
+    import guard_hook
+    pane = tmux("display-message", "-p", "-t", TARGET, "#{pane_id}").strip()
+    monkeypatch.setenv("TMUX_PANE", pane)
+    transcript = tmp_path / "observer.jsonl"
+    transcript.touch()
+    token = "request_user_input:failed-call"
+    guard_hook.question_state(token, True)
+    guard_hook.start_result_watch(token, str(transcript), 0)
+    transcript.write_text(json.dumps({"type": "response_item", "payload": {
+        "type": "function_call_output", "call_id": "failed-call",
+        "output": "request_user_input is unavailable in Default mode"}}) + "\n")
+    deadline = time.monotonic() + 3
+    while server.guard.snapshot(TARGET).question and time.monotonic() < deadline:
+        time.sleep(.05)
+    assert server.guard.snapshot(TARGET).question == ""
+
+
+def test_detached_queue_delivers_after_draft_clears(monkeypatch, tmp_path):
+    """An actual process named codex, real tmux socket, and detached worker."""
+    source = tmp_path / "fake_codex.c"
+    binary = tmp_path / "codex"
+    receipt = tmp_path / "receipt"
+    source.write_text(r'''
+#include <termios.h>
+#include <unistd.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+    struct termios raw; tcgetattr(0, &raw); cfmakeraw(&raw); tcsetattr(0, TCSANOW, &raw);
+    printf("\033[2J\033[H• Done.\r\n› Nate draft\033[2;3H"); fflush(stdout);
+    usleep(1800000);
+    printf("\033[2J\033[H• Done.\r\n› Ask Codex to do anything\033[2;3H"); fflush(stdout);
+    char buffer[4096]; int n=read(0, buffer, sizeof(buffer));
+    FILE *f=fopen(argv[3], "wb"); if (n>0) fwrite(buffer, 1, n, f); fclose(f);
+    sleep(10); return 0;
+}
+''')
+    subprocess.run(["cc", str(source), "-o", str(binary)], check=True, capture_output=True)
+    session = "12345678-1234-1234-1234-123456789abc"
+    command = f"{shlex.quote(str(binary))} resume {session} {shlex.quote(str(receipt))}"
+    tmux("send-keys", "-t", TARGET, "-l", command)
+    tmux("send-keys", "-t", TARGET, "Enter")
+    time.sleep(.3)
+    monkeypatch.setattr(server.delivery, "QUEUE_DIR", tmp_path / "messages")
+    result = server.tmux_message("From Claude: queued test", TARGET, wait_seconds=0)
+    assert result.startswith("QUEUED ")
+    assert not receipt.exists()
+    message_id = result.split()[1].rstrip(":")
+    deadline = time.monotonic() + 7
+    while not server.tmux_message_status(message_id).startswith("DELIVERED") and time.monotonic() < deadline:
+        time.sleep(.1)
+    assert server.tmux_message_status(message_id).startswith("DELIVERED")
+    assert b"From Claude: queued test" in receipt.read_bytes()

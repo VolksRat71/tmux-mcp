@@ -141,7 +141,19 @@ def deliver(pane, keys, literal, enter):
     return ""
 
 
-def send(target, keys, literal=False, enter=False, wait_seconds=25):
+def input_fingerprint(state):
+    """Track input stability, not unrelated scrolling/progress output.
+
+    block_reason still checks the whole relevant screen for dialogs and
+    questions on every sample, including the final sample before delivery.
+    """
+    lines = state.screen.splitlines()
+    composer = lines[state.cursor_y] if 0 <= state.cursor_y < len(lines) else None
+    return (state.pane, state.socket, state.kind, state.foreground, composer,
+            state.cursor_y, state.cursor_x, state.activity, state.question, state.in_mode)
+
+
+def send(target, keys, literal=False, enter=False, wait_seconds=25, cancelled=None):
     """Wait for safe input and send once. Empty result means delivered.
 
     A timeout does not retain a message or send it later. All MCP processes
@@ -153,6 +165,8 @@ def send(target, keys, literal=False, enter=False, wait_seconds=25):
     previous = None
     reason = "checking input"
     while True:
+        if cancelled and cancelled():
+            return "CANCELLED: no input sent"
         try:
             s = snapshot(target)
             key = hashlib.sha256((s.socket + s.pane).encode()).hexdigest()
@@ -168,9 +182,10 @@ def send(target, keys, literal=False, enter=False, wait_seconds=25):
                     if current.socket != s.socket or current.pane != s.pane:
                         return "NOT SENT: pane identity changed."
                     reason = block_reason(current)
-                    if current != previous:
+                    fingerprint = input_fingerprint(current)
+                    if fingerprint != previous:
                         ready_since = None
-                    previous = current
+                    previous = fingerprint
                     if reason:
                         ready_since = None
                     else:
@@ -178,7 +193,7 @@ def send(target, keys, literal=False, enter=False, wait_seconds=25):
                         if not current.kind or time.monotonic() - ready_since >= STABLE_SECONDS:
                             final = snapshot(current.pane)
                             reason = block_reason(final)
-                            if final != current or reason:
+                            if input_fingerprint(final) != fingerprint or reason:
                                 ready_since = None
                                 reason = reason or "input changed before delivery"
                             else:
@@ -188,12 +203,14 @@ def send(target, keys, literal=False, enter=False, wait_seconds=25):
                                 if current.kind and last.get("digest") == digest and time.time() - last.get("at", 0) < 15:
                                     return "NOT SENT: duplicate peer message within 15 seconds; do not resend."
                                 # Record the attempt before writing: uncertain errors must not duplicate sends.
+                                if cancelled and cancelled():
+                                    return "CANCELLED: no input sent"
                                 record.write_text(json.dumps({"digest": digest, "at": time.time()}))
                                 return deliver(current.pane, keys, literal, enter)
         except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as exc:
             return f"NOT SENT or delivery uncertain: {exc}. Inspect the pane before retrying."
         if time.monotonic() >= deadline:
-            return f"NOT SENT: {reason}. Nothing queued; wait and retry through the guarded tool."
+            return f"NOT SENT: {reason or 'waiting for input area to settle'}. Nothing queued; wait and retry through the guarded tool."
         time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
 
 
@@ -204,11 +221,16 @@ if __name__ == "__main__":
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--file", help="UTF-8 message file; avoids shell quoting problems")
     parser.add_argument("--wait", type=float, default=25)
+    parser.add_argument("--queue", action="store_true", help="retain a peer message until safe, up to one hour")
     args = parser.parse_args()
     if args.check:
         s = snapshot(args.target)
         print(json.dumps({"pane": s.pane, "kind": s.kind, "blocked": block_reason(s) or None}))
     elif args.file:
+        if args.queue:
+            from delivery import enqueue
+            print(enqueue(args.target, Path(args.file).read_text(), args.wait))
+            raise SystemExit(0)
         result = send(args.target, [Path(args.file).read_text()], literal=True, enter=True, wait_seconds=args.wait)
         print(result or "DELIVERED")
         raise SystemExit(1 if result else 0)

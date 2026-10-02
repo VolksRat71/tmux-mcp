@@ -105,3 +105,24 @@ def test_another_process_owns_delivery_lock(monkeypatch, tmp_path):
     finally:
         process.terminate()
         process.wait(timeout=3)
+
+
+def test_progress_output_does_not_prevent_delivery(monkeypatch, tmp_path):
+    monkeypatch.setattr(guard, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(guard, "STABLE_SECONDS", .01)
+    monkeypatch.setattr(guard, "POLL_SECONDS", .02)
+    counter = iter(range(100))
+    monkeypatch.setattr(guard, "snapshot", lambda target:
+                        screen(f"• Completed file {next(counter)}.\n› Ask Codex to do anything"))
+    writes = []
+    monkeypatch.setattr(guard, "deliver", lambda *args: writes.append(args) or "")
+    assert guard.send("%7", ["peer"], literal=True, enter=True, wait_seconds=.2) == ""
+    assert len(writes) == 1
+
+
+def test_settling_timeout_has_explanation(monkeypatch, tmp_path):
+    monkeypatch.setattr(guard, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(guard, "snapshot", lambda target: screen("› Ask Codex to do anything"))
+    result = guard.send("%7", ["peer"], literal=True, enter=True, wait_seconds=0)
+    assert "NOT SENT: ." not in result
+    assert "settle" in result
