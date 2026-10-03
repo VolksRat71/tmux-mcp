@@ -26,6 +26,38 @@ def test_retries_reuse_pending_message(queue):
     assert len(list(queue.glob("*.json"))) == 1
 
 
+@pytest.mark.parametrize("reason", [
+    "NOT SENT: agent is working. Nothing queued; wait and retry through the guarded tool.",
+    "NOT SENT: unfinished human draft",
+    "waiting for safe input; do not resend",
+])
+def test_pending_status_never_tells_sender_to_retry(queue, reason):
+    delivery.enqueue("%7", "peer", wait_seconds=0)
+    path = next(queue.glob("*.json"))
+    job = json.loads(path.read_text())
+    job.update(status="waiting", reason=reason)
+    path.write_text(json.dumps(job))
+
+    out = delivery.status(path.stem)
+    assert out.startswith("QUEUED " + path.stem)
+    assert "automatically" in out
+    assert "do not resend" in out.lower()
+    assert "Nothing queued" not in out
+    assert "retry" not in out
+    assert "NOT SENT" not in out
+    assert json.loads(path.read_text())["text"] == "peer"
+
+
+def test_terminal_status_preserves_uncertain_delivery_warning(queue):
+    delivery.enqueue("%7", "peer", wait_seconds=0)
+    path = next(queue.glob("*.json"))
+    job = json.loads(path.read_text())
+    reason = "NOT SENT or delivery uncertain: tmux timed out. Inspect the pane before retrying."
+    job.update(status="failed", reason=reason)
+    path.write_text(json.dumps(job))
+    assert delivery.status(path.stem) == f"FAILED {path.stem}: {reason}"
+
+
 def test_worker_waits_then_delivers_once(queue, monkeypatch):
     delivery.enqueue("%7", "peer", wait_seconds=0)
     path = next(queue.glob("*.json"))

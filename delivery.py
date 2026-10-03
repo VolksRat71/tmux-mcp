@@ -52,7 +52,15 @@ def status(message_id):
                     job.update(status="failed", reason="delivery worker exited; inspect the pane before retrying", updated=time.time())
                     job.pop("text", None)
                     save(path, job)
-    label = {"sent": "DELIVERED", "waiting": "QUEUED"}.get(job["status"], job["status"].upper())
+    if job["status"] not in TERMINAL:
+        # The synchronous guard retains nothing, but this queue does. Translate
+        # its timeout advice here, including records from already-running workers.
+        reason = job.get("reason", "waiting for safe input").removeprefix("NOT SENT: ")
+        reason = reason.split(". Nothing queued;", 1)[0].removesuffix("; do not resend")
+        return (f"QUEUED {message_id}: {reason}. "
+                "Delivery continues automatically when input is safe; do not resend. "
+                "Check tmux_message_status for the outcome.")
+    label = {"sent": "DELIVERED"}.get(job["status"], job["status"].upper())
     return f"{label} {message_id}: {job.get('reason', '')}"
 
 
