@@ -69,10 +69,12 @@ progress output does not restart the stability timer. It
 rechecks under a shared per-pane process lock immediately before delivery.
 
 An unfinished draft stays protected regardless of how long the user pauses.
-Unknown layouts, copy mode, a stopped agent, and possible unanswered prose
-questions block delivery. Only the latest visible assistant response is
-checked for prose questions; this is conservative heuristic detection, not
-semantic certainty. The screen adapters currently recognize the observed
+Unknown layouts, copy mode, a stopped agent, an active question dialog, and
+tracked question-tool calls block delivery. Ordinary conversation text does
+not lock the input, including direct prose questions, quoted questions and
+summaries of decisions in other panes. Use a structured question tool when an
+answer needs protected input; an untracked question outside a recognized dialog
+does not create a hold. The screen adapters currently recognize the observed
 Claude and Codex layouts and Codex's `Ask Codex to do anything` placeholder.
 Other placeholders/layouts may remain blocked until cleared or supported.
 

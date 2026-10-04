@@ -307,7 +307,7 @@ def test_detached_observer_clears_failed_question_on_private_pane(monkeypatch, t
     assert server.guard.snapshot(TARGET).question == ""
 
 
-def test_detached_queue_delivers_after_draft_clears(monkeypatch, tmp_path):
+def test_detached_queue_delivers_after_draft_clears_despite_prose_question(monkeypatch, tmp_path):
     """An actual process named codex, real tmux socket, and detached worker."""
     source = tmp_path / "fake_codex.c"
     binary = tmp_path / "codex"
@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
     struct termios raw; tcgetattr(0, &raw); cfmakeraw(&raw); tcsetattr(0, TCSANOW, &raw);
     printf("\033[2J\033[H• Done.\r\n› Nate draft\033[2;3H"); fflush(stdout);
     usleep(1800000);
-    printf("\033[2J\033[H• Done.\r\n› Ask Codex to do anything\033[2;3H"); fflush(stdout);
+    printf("\033[2J\033[H• The decision still waiting on you is in the other pane.\r\n› Ask Codex to do anything\033[2;3H"); fflush(stdout);
     char buffer[4096]; int n=read(0, buffer, sizeof(buffer));
     FILE *f=fopen(argv[3], "wb"); if (n>0) fwrite(buffer, 1, n, f); fclose(f);
     sleep(10); return 0;

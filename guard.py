@@ -108,13 +108,8 @@ def block_reason(s, now=None):
         if stripped.startswith(("─", "GPT-", "gpt-", "← for agents", "? for shortcuts")) or re.match(r"\d+% context left", stripped):
             break
         return "multiline draft or unrecognized composer footer"
-    # Only the latest visible assistant response counts, not old chat questions.
-    preceding = lines[:s.cursor_y]
-    starts = [i for i, line in enumerate(preceding)
-              if re.match(r"^[•⏺]\s", line)]
-    latest = "\n".join(preceding[starts[-1]:] if starts else preceding)
-    if "?" in latest or re.search(r"waiting (on|for) (you|nate)|need (your|nate.s) (answer|decision|approval)|questions? (for nate|remain|pending)", latest, re.I):
-        return "possible unanswered human question"
+    # Ordinary chat (including questions and summaries about other panes) is
+    # not input state. Explicit question markers and dialogs are checked above.
     return ""
 
 
@@ -144,8 +139,8 @@ def deliver(pane, keys, literal, enter):
 def input_fingerprint(state):
     """Track input stability, not unrelated scrolling/progress output.
 
-    block_reason still checks the whole relevant screen for dialogs and
-    questions on every sample, including the final sample before delivery.
+    block_reason still checks for dialogs and explicit question markers on
+    every sample, including the final sample before delivery.
     """
     lines = state.screen.splitlines()
     composer = lines[state.cursor_y] if 0 <= state.cursor_y < len(lines) else None

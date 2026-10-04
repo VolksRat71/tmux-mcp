@@ -18,7 +18,6 @@ def screen(body, kind="codex", activity=0, hook=""):
     ("• Done.\n› Re\n  GPT-6", "draft"),
     ("• Done.\n› first line\n  second line\n  GPT-6", "draft"),
     ("• Done.\n› \n  draft below the cursor\n  GPT-6", "draft"),
-    ("• Which export path should I use?\n› Ask Codex to do anything\n  GPT-6", "question"),
     ("  1. Yes\n› 2. No\n  Enter to select", "dialog"),
     ("• Working (esc to interrupt)\n› Ask Codex to do anything", "working"),
 ])
@@ -33,6 +32,22 @@ def test_recent_human_activity_blocks_empty_prompt():
 def test_old_question_does_not_block_after_new_answer():
     s = screen("• Which one?\n› Option one\n• Done.\n› Ask Codex to do anything")
     assert guard.block_reason(s, now=100) == ""
+
+
+@pytest.mark.parametrize("prose", [
+    "The one thing still waiting on you there is approving Codex A's plans.",
+    'Updated the slide titled "Where is Pim?". Done.',
+    "Deferred questions remain about Qwen; training work can continue.",
+    "Which export path should I use?",
+])
+@pytest.mark.parametrize("kind, marker", [("claude", "❯"), ("codex", "›")])
+def test_ordinary_prose_does_not_lock_empty_composer(prose, kind, marker):
+    body = f"• {prose}\n{marker} \n────"
+    assert guard.block_reason(screen(body, kind), now=100) == ""
+    # The same prose must not weaken explicit input protection.
+    assert "question" in guard.block_reason(screen(body, kind, hook="question:1"), now=100)
+    assert "typing" in guard.block_reason(screen(body, kind, activity=99), now=100)
+    assert "draft" in guard.block_reason(screen(body.replace(f"{marker} ", f"{marker} Nate draft"), kind), now=100)
 
 
 def test_question_hook_overrides_empty_prompt():
