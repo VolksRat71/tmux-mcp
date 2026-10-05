@@ -24,6 +24,7 @@ import time
 
 import guard
 import delivery
+import worker
 
 from mcp.server.fastmcp import FastMCP
 
@@ -49,6 +50,11 @@ tmux protocol for agents:
   while human typing, drafts or questions block delivery. QUEUED means keep
   working; do not resend. Use tmux_message_status to check delivery. Never
   bypass the guard with shell send-keys.
+- Use worker_submit for bounded, context-heavy read-only Qwen tasks. Claude,
+  Codex and their subagents keep ownership of decisions and verification.
+  worker_status returns lifecycle, OpenCode session/title, and report path;
+  completed means a report was produced, not that its evidence was accepted.
+  Do not resubmit a queued/running job or read raw progress into your context.
 """
 
 mcp = FastMCP("tmux", instructions=INSTRUCTIONS)
@@ -399,6 +405,42 @@ def tmux_input_status(target: str) -> str:
     """Read why an agent pane is protected, without sending any input."""
     state = guard.snapshot(target)
     return f"[{state.pane} | {state.kind or 'other'} | {guard.block_reason(state) or 'ready'}]"
+
+
+@mcp.tool()
+def worker_submit(task: str, cwd: str, scope: list[str], owner: str,
+                  timeout_seconds: int = 600) -> dict:
+    """Delegate one bounded read-only task to the shared local Qwen scout.
+
+    Specify an absolute working directory, explicit search paths in scope,
+    an evidence-oriented task and the caller's owner label. No edits or test
+    execution. Best for broad discovery, tracing, review or log analysis;
+    avoid trivial lookups and work whose context you already have.
+    Returns a job ID immediately; check worker_status, never submit copies.
+    Local inference waits for the shared GPU lock. Job state is separate from
+    tmux message delivery. Orchestrators must verify the final evidence.
+    """
+    return worker.submit(task, cwd, scope, owner, timeout_seconds)
+
+
+@mcp.tool()
+def worker_status(job_id: str) -> dict:
+    """Read compact job state, observability metadata and final report path.
+
+    Does not paste progress into a pane or return bulk tool output. Read the
+    final report once completed; inspect cited evidence before accepting it.
+    """
+    return worker.status(job_id)
+
+
+@mcp.tool()
+def worker_cancel(job_id: str) -> dict:
+    """Request cancellation of a local worker job; check status for outcome.
+
+    A request is not proof that server-side inference has stopped. The worker
+    owns cleanup and keeps resource protection until termination is verified.
+    """
+    return worker.cancel(job_id)
 
 
 @mcp.tool()

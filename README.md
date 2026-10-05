@@ -1,7 +1,8 @@
 # tmux-mcp
 
 An MCP server that lets an AI agent drive tmux panes without tripping over
-itself. Single Python file, no dependencies beyond `mcp` and tmux.
+itself. Includes guarded peer messaging and optional shared local Qwen jobs.
+The core requires only Python, `mcp` and tmux.
 
 ## Why this exists
 
@@ -25,6 +26,8 @@ refused.
 | `tmux_message(text, target, wait_seconds=25)` | Peer Claude/Codex messages. Waits initially, then returns a queued ID while safe delivery continues automatically. |
 | `tmux_message_status(message_id)`, `tmux_cancel_message(message_id)` | Inspect or request cancellation of a queued peer message. |
 | `tmux_input_status(target)` | Read the reason a pane is protected. |
+| `worker_submit(task, cwd, scope, owner, timeout_seconds=600)` | Submit bounded, read-only work to local Qwen; returns a job ID immediately. |
+| `worker_status(job_id)`, `worker_cancel(job_id)` | Inspect or cancel a headless job, including its OpenCode session, timing and final report path. |
 | `tmux_run(command, target)` | **Start here.** Types a shell command, presses Enter, and polls until the shell prompt is back and the screen has stopped changing, or until `timeout` seconds. Returns a status header plus the pane tail. |
 | `tmux_wait_and_read(target, seconds, until_text)` | Wait for a pane to go idle, or for `until_text` to appear, with `seconds` as an upper bound. Returns as soon as either happens. |
 | `tmux_send_text(text, target, enter=True)` | Type literal text into an interactive program such as a REPL or a prompt. |
@@ -58,10 +61,10 @@ pane is still busy, the send is refused and the response points at
 `tmux_wait_and_read`. Pass `force=True` to override. Idle panes accept
 repeats freely.
 
-### Human input protection (Claude and Codex)
+### Human input protection
 
 Agent panes are detected by session/foreground name, or the pane option
-`@mcp_agent_kind` (`claude` / `codex`). All three legacy send tools also use
+`@mcp_agent_kind` (`claude` / `codex` / `opencode`). All three legacy send tools also use
 the guard; `force` cannot bypass human input protection. The guard waits up
 to 25 seconds for a recognized empty composer, no question/dialog, three
 seconds without client activity, and one second of stable input state. Unrelated
@@ -77,6 +80,11 @@ answer needs protected input; an untracked question outside a recognized dialog
 does not create a hold. The screen adapters currently recognize the observed
 Claude and Codex layouts and Codex's `Ask Codex to do anything` placeholder.
 Other placeholders/layouts may remain blocked until cleared or supported.
+
+OpenCode is recognized and protected, but interactive delivery is currently
+blocked: the adapter cannot verify which conversation tab is active. Empty
+composer detection alone cannot prevent a message reaching the wrong session.
+Use headless worker jobs for Qwen; these target a fresh, explicit session ID.
 
 `tmux_message` retains the message in a private OS-temp queue if the initial
 wait expires, returning `QUEUED` and a message ID. A detached worker keeps
@@ -128,6 +136,64 @@ interpolation. Label peer messages with their sender. Never submit a peer
 message as the answer to a human question. A small race remains between the
 final screen check and physical keyboard input: eliminating it would require
 an input proxy, not polling. No changes to tmux keyboard bindings are made.
+
+### Shared local Qwen jobs
+
+Claude, Codex and their subagents can offload a bounded discovery, tracing,
+review or log-analysis task when reading the source would cost substantially
+more context than checking a compact report. Keep trivial lookups, already-loaded
+context and high-level decisions with the orchestrator. One substantial task
+usually works better than many tiny calls.
+
+The optional runner uses the installed OpenCode V2 service and local
+`llamaswap/qwen38-27b` model. It creates a fresh restricted `scout` session;
+the title `qwen-worker:<owner> [<short-id>]` and session ID let you find the work
+in OpenCode.
+Status includes owner, scope, effective tools, elapsed time, revision/dirty
+state, available token counts and final report path. No raw progress is returned
+to the calling agent. It does not estimate premium tokens saved.
+
+```sh
+python3 worker.py submit <<'JSON'
+{"task":"Trace guarded delivery and its retry behavior. Cite paths, symbols, line numbers, inspected tests and gaps in at most 40 lines.","cwd":"/absolute/path/to/tmux-mcp","scope":["guard.py","delivery.py","test_guard.py"],"owner":"codex:delivery-review","timeout_seconds":600}
+JSON
+python3 worker.py status qw-JOB_ID
+python3 worker.py cancel qw-JOB_ID
+```
+
+The timeout includes time waiting for the existing shared GPU lock. Jobs never
+reclaim another owner's lock. An active shared-service session also blocks a
+new run, even if its CLI exited and its owner released the lock. Repeated
+identical in-flight submissions reuse
+the job when the bounded scope inventory still matches; completed reports are
+not automatically cached or reused. Queued jobs fail if their scope changes
+before execution. Check the
+existing ID instead of resubmitting. Manual reuse requires checking relevant
+content and file inventory, not just HEAD.
+
+Sessions default-deny capabilities and allow native reads only within the
+declared scope. Narrow scopes use `read`, which also lists directories.
+Native `grep`/`glob` permissions match search patterns rather than paths, so
+these tools require the whole Git-root scope with no escaping symlinks.
+Symlink reads are denied. These are OpenCode permission rules, not an OS
+sandbox. Shell commands, edits, test execution, delegation, web and MCP tools
+are denied. Test review means reading tests or supplied results.
+
+`completed` requires a final structured stop with nonempty text, successful
+CLI exit and an inactive server session. If the CLI omits the final completion
+event, the runner verifies the bounded authoritative session transcript,
+including its completed assistant message and successful idle outcome.
+It means a report was produced;
+the orchestrator still checks its evidence and owns acceptance. Cancellation
+interrupts the server session, since killing the CLI alone does not stop
+inference. If server inactivity cannot be confirmed, status becomes
+`cleanup_required` and retains the owned GPU lock for inspection.
+
+This runner targets the locally inspected OpenCode V2 2.0.20 API/event protocol.
+Unknown events or permission responses fail closed. Existing MCP connections
+must reconnect to expose the new tools; the CLI is available immediately.
+The model and shared GPU lock location are currently local defaults in
+`worker.py`; configure those before using it on another machine.
 
 ### Server instructions
 
