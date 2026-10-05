@@ -33,6 +33,10 @@ def is_agent(target):
     return bool(guard.snapshot(target).kind)
 
 
+class UnverifiedSessionIdentity(ValueError):
+    """The pane cannot be bound to its currently selected conversation."""
+
+
 def pane_session(pane):
     """Identify the resumed TUI under this pane, not the shared app-server.
 
@@ -40,6 +44,11 @@ def pane_session(pane):
     sessions. Never use that variable alone as evidence of session ownership.
     Unidentifiable/fresh sessions retain screen protection, without a latch.
     """
+    if guard.snapshot(pane).kind == "opencode":
+        # OpenCode --session is only an initial selection. Its TUI can switch
+        # tabs in the same process; neither argv nor displayed titles bind a
+        # queued message to its intended conversation. Refuse queue creation.
+        raise UnverifiedSessionIdentity(guard.OPENCODE_IDENTITY_REASON)
     root = int(guard.tmux("display-message", "-p", "-t", pane, "#{pane_pid}").strip())
     result = subprocess.run(["ps", "-axo", "pid=,ppid=,command="],
                             capture_output=True, text=True, timeout=3, check=True)
@@ -76,7 +85,10 @@ def session_from_processes(table, root):
 def owns_pane(payload):
     pane = os.environ.get("TMUX_PANE")
     session = payload.get("session_id")
-    return bool(pane and session and pane_session(pane) == session)
+    try:
+        return bool(pane and session and pane_session(pane) == session)
+    except UnverifiedSessionIdentity:
+        return False  # An inherited OpenCode pane is not this hook's session.
 
 
 def is_question_result(line, call_id):

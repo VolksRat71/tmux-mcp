@@ -3,6 +3,7 @@ import pytest
 import hashlib
 import subprocess
 import sys
+from dataclasses import replace
 
 import guard
 
@@ -141,3 +142,63 @@ def test_settling_timeout_has_explanation(monkeypatch, tmp_path):
     result = guard.send("%7", ["peer"], literal=True, enter=True, wait_seconds=0)
     assert "NOT SENT: ." not in result
     assert "settle" in result
+
+
+def opencode_screen(composer="", footer="shift+tab agents  ctrl+p commands"):
+    # Geometry observed on the live OpenCode home/session composer, including
+    # blank padding rows and the model row outside the editable input.
+    body = ("Previous output\n\n  ┃\n  ┃" + ("  " + composer if composer else "")
+            + "\n  ┃\n  ┃  Scout · Qwen3.8 27B (local, dense) llama-swap (local)"
+            + "\n  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n  " + footer + "\n")
+    return guard.Snapshot("%7", "opencode", "opencode", body, 3, 5, 0, "")
+
+
+@pytest.mark.parametrize("session, foreground, registered", [
+    ("work", "opencode", ""), ("codex-agent", "opencode", "codex"),
+    ("qwen-agent", "zsh", ""), ("opencode-agent", "node", ""),
+])
+def test_opencode_snapshot_never_falls_through_as_shell(monkeypatch, session, foreground, registered):
+    def tmux(*args):
+        if args[0] == "display-message":
+            return f"%7|{session}|{foreground}|3|5|{registered}||0|/tmp/test-socket\n"
+        if args[0] == "list-clients":
+            return ""
+        assert args[0] == "capture-pane"
+        return opencode_screen().screen
+    monkeypatch.setattr(guard, "tmux", tmux)
+    state = guard.snapshot("%7")
+    assert state.kind == "opencode"
+    assert guard.block_reason(state)
+
+
+@pytest.mark.parametrize("composer", ["", 'Ask anything… "Fix broken tests"'])
+def test_opencode_empty_home_and_session_composers_are_recognized(composer):
+    state = opencode_screen(composer)
+    assert guard.opencode_composer_reason(state) == ""
+    assert "identity" in guard.block_reason(state, now=100)
+
+
+@pytest.mark.parametrize("state, reason", [
+    (opencode_screen("Nate draft"), "draft"),
+    (opencode_screen("\n  ┃  second line"), "draft"),
+    (replace(opencode_screen("   "), cursor_x=8), "draft"),
+    (opencode_screen(footer="⬝⬝■■ esc interrupt  ↓ 2 shells  ctrl+p commands"), "working"),
+    (opencode_screen(footer="Permission required: Allow once  Reject"), "dialog"),
+    (opencode_screen(footer="Question: Enter to confirm  esc to cancel"), "dialog"),
+    (opencode_screen(footer="new unrecognized footer"), "unrecognized"),
+    (replace(opencode_screen(), screen="Something changed", cursor_y=0), "unrecognized"),
+    (replace(opencode_screen(), cursor_y=0), "unrecognized"),
+])
+def test_opencode_occupied_or_unknown_composers_are_protected(state, reason):
+    assert reason in guard.opencode_composer_reason(state)
+    assert reason in guard.block_reason(state, now=100)
+
+
+def test_opencode_empty_screen_does_not_submit_without_conversation_identity(monkeypatch, tmp_path):
+    monkeypatch.setattr(guard, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(guard, "STABLE_SECONDS", 0)
+    monkeypatch.setattr(guard, "snapshot", lambda target: opencode_screen())
+    writes = []
+    monkeypatch.setattr(guard, "deliver", lambda *args: writes.append(args))
+    assert "identity" in guard.send("%7", ["peer"], literal=True, enter=True, wait_seconds=0)
+    assert not writes

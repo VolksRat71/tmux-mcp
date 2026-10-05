@@ -110,3 +110,57 @@ def test_session_binding_ignores_shared_daemon_and_other_terminals():
 
 def test_unidentified_fresh_tui_does_not_claim_a_session():
     assert guard_hook.session_from_processes("100 1 zsh\n101 100 codex\n", 100) == ""
+
+
+@pytest.mark.parametrize("tool", ["tmux_send_keys", "tmux_send_text", "tmux_run"])
+def test_legacy_opencode_writes_are_denied(monkeypatch, tool):
+    def tmux(*args):
+        if args[0] == "display-message":
+            return "%7|qwen-agent|opencode|0|5|||0|/tmp/test-socket\n"
+        if args[0] == "list-clients":
+            return ""
+        return "Unknown OpenCode UI"
+    monkeypatch.setattr(guard_hook.guard, "tmux", tmux)
+    result = guard_hook.handle({"hook_event_name": "PreToolUse", "tool_name": "mcp__tmux__" + tool,
+                               "tool_input": {"target": "%7", "keys": "Enter"}})
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_opencode_launch_session_does_not_claim_active_conversation():
+    # OpenCode can change sessions without changing process argv. Neither its
+    # ses_ identifier nor a UUID-shaped argument proves the selected TUI tab.
+    for session in ("ses_example", "12345678-1234-1234-1234-123456789abc"):
+        table = f"100 1 zsh\n101 100 opencode --session {session}\n"
+        assert guard_hook.session_from_processes(table, 100) == ""
+
+
+def test_opencode_queue_refuses_unverified_or_changed_conversation(monkeypatch, tmp_path):
+    import delivery
+    from test_guard import opencode_screen
+    from dataclasses import replace
+    monkeypatch.setattr(delivery, "QUEUE_DIR", tmp_path)
+    launched = []
+    monkeypatch.setattr(delivery, "launch", lambda path: launched.append(path))
+    def tmux(*args):
+        if "#{pid}|#{pane_pid}" in args:
+            return "10|100\n"
+        raise AssertionError("No launch-argv inference can establish the active OpenCode tab")
+    monkeypatch.setattr(guard_hook.guard, "tmux", tmux)
+    for title in ("Conversation A", "Conversation B"):
+        state = replace(opencode_screen(), screen=title + "\n" + opencode_screen().screen)
+        monkeypatch.setattr(guard_hook.guard, "snapshot", lambda target: state)
+        with pytest.raises(ValueError, match="identity"):
+            delivery.enqueue("%7", "peer", wait_seconds=0)
+    assert not launched
+    assert not list(tmp_path.glob("*.json"))
+
+
+def test_foreign_hook_inheriting_opencode_pane_does_not_latch_or_deny_question(monkeypatch):
+    from test_guard import opencode_screen
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.setattr(guard_hook.guard, "snapshot", lambda target: opencode_screen())
+    changes = []
+    monkeypatch.setattr(guard_hook, "question_state", lambda *args: changes.append(args))
+    assert guard_hook.handle({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+                              "tool_use_id": "foreign", "session_id": "claude-session"}) == {}
+    assert not changes

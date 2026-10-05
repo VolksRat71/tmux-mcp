@@ -1,4 +1,4 @@
-"""Shared automatic input guard for Claude/Codex panes (stdlib only).
+"""Shared automatic input guard for Claude/Codex/OpenCode panes (stdlib only).
 
 Unknown UI states fail closed. This reduces input races; it is not a keyboard
 interceptor. Raw tmux writes bypass this module and must not be used by agents.
@@ -19,6 +19,9 @@ STATE_DIR = Path(tempfile.gettempdir()) / f"tmux-mcp-guard-{os.getuid()}"
 QUIET_SECONDS = 3.0
 STABLE_SECONDS = 1.0
 POLL_SECONDS = .25
+OPENCODE_IDENTITY_REASON = (
+    "OpenCode active conversation identity is unverified; interactive delivery is unsupported"
+)
 
 
 def tmux(*args, input_text=None):
@@ -52,7 +55,12 @@ def snapshot(target):
     pane, session, fg, cy, cx, registered, question, mode, socket = tmux(
         "display-message", "-p", "-t", target, fmt).strip().split("|")
     kind = registered
-    if not kind:
+    # Foreground evidence outranks stale registrations (e.g. replacing Codex in
+    # an existing pane). Named worker panes stay protected after app exit too.
+    if (fg.lower() == "opencode" or registered.lower() in {"opencode", "qwen"}
+            or re.search(r"(?:^|[-_ ])(?:qwen|opencode)(?:$|[-_ ])", session.lower())):
+        kind = "opencode"
+    elif not kind:
         if "codex" in (session + " " + fg).lower():
             kind = "codex"
         elif "claude" in (session + " " + fg).lower() or re.fullmatch(r"\d+\.\d+\.\d+", fg):
@@ -77,9 +85,14 @@ def block_reason(s, now=None):
         return "human question pending: " + s.question
     if now - s.activity < QUIET_SECONDS:
         return "recent human typing/activity"
-    if not (s.foreground in {"claude", "codex", "node"} or
+    allowed_foregrounds = {"opencode"} if s.kind == "opencode" else {"claude", "codex", "node"}
+    if not (s.foreground in allowed_foregrounds or
             (s.kind == "claude" and re.fullmatch(r"\d+\.\d+\.\d+", s.foreground))):
         return "agent is no longer the foreground application"
+    if s.kind == "opencode":
+        # A recognized empty composer is necessary, but not sufficient: the
+        # TUI can switch conversations without changing launch argv or pane ID.
+        return opencode_composer_reason(s) or OPENCODE_IDENTITY_REASON
     lines = s.screen.splitlines()
     if not 0 <= s.cursor_y < len(lines):
         return "unrecognized input position"
@@ -110,6 +123,48 @@ def block_reason(s, now=None):
         return "multiline draft or unrecognized composer footer"
     # Ordinary chat (including questions and summaries about other panes) is
     # not input state. Explicit question markers and dialogs are checked above.
+    return ""
+
+
+def opencode_composer_reason(s):
+    """Recognize only observed boxed input layouts; this does not authorize sends.
+
+    OpenCode's cursor is column five between blank padding rows, followed by
+    an agent/model row, a heavy bottom border and the command footer. Unknown
+    variations remain protected until observed and covered by a fixture.
+    """
+    lines = s.screen.splitlines()
+    if not 0 <= s.cursor_y < len(lines):
+        return "unrecognized input position"
+    tail = "\n".join(lines[max(0, s.cursor_y - 12):]).lower()
+    if re.search(r"permission required|allow once|enter to (select|confirm)|esc to cancel|submit answer", tail):
+        return "question/permission dialog"
+    if re.search(r"esc(?:ape)?(?: to)? interrupt|ctrl\+c to interrupt", tail):
+        return "agent is working"
+    # Parse from the bottom, so earlier tool-output boxes cannot masquerade as
+    # the composer. capture-pane removes unused trailing terminal whitespace.
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if end < 6 or not re.fullmatch(r"(?:shift\+tab agents\s+)?ctrl\+p commands", lines[end - 1].strip()):
+        return "unrecognized OpenCode composer footer"
+    border, model = end - 2, end - 3
+    if (not re.fullmatch(r"  ╹▀+", lines[border])
+            or not re.fullmatch(r"  ┃  \S[^┃]* · \S[^┃]*", lines[model])):
+        return "unrecognized OpenCode composer boundary"
+    start = model - 1
+    while start >= 0 and lines[start].startswith("  ┃"):
+        start -= 1
+    start += 1
+    if model - start < 3 or not start < s.cursor_y < model - 1:
+        return "unrecognized OpenCode composer or multiline draft"
+    if s.cursor_x != 5:
+        return "unfinished human draft or selection dialog"
+    if lines[start] != "  ┃" or lines[model - 1] != "  ┃":
+        return "multiline draft or unrecognized composer padding"
+    inputs = lines[start + 1:model - 1]
+    if len(inputs) != 1 or inputs[0] not in {"  ┃", '  ┃  Ask anything… "Fix broken tests"'}:
+        return "unfinished human draft or multiline draft"
     return ""
 
 
