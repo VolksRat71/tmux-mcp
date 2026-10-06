@@ -30,17 +30,22 @@ if args[0] == 'api':
     if args[1:3] == ['post', '/api/session']:
         body = json.loads(args[args.index('--data') + 1])
         (base / 'created.json').write_text(json.dumps(body))
-        print(json.dumps(dict(body, id='ses_fake')))
+        count_file = base / 'session_count'
+        count = int(count_file.read_text()) + 1 if count_file.exists() else 1
+        count_file.write_text(str(count))
+        print(json.dumps(dict(body, id='ses_fake' if count == 1 else 'ses_fake2')))
     elif 'interrupt' in args[2]:
-        if mode == 'abort_failure': sys.exit(1)
+        if mode in ('abort_failure', 'budget_abort_failure'): sys.exit(1)
         (base / 'interrupted').touch()
         print('{}')
     elif args[2] == '/api/session/active':
         print(json.dumps({'ses_foreign': {'status': 'running'}} if mode == 'foreign_active' else {}))
     elif '/message?' in args[2]:
+        if mode == 'budget_api_slow' and not (base / 'interrupted').exists(): time.sleep(3)
+        if mode == 'budget_writeup_verify_slow' and 'ses_fake2/' in args[2]: time.sleep(3)
         prompt = (base / 'prompt').read_text()
         messages = [{'id':'msg_user','type':'user','text':prompt,'time':{'created':1}}]
-        if mode.startswith('replay_'):
+        if mode.startswith('replay_') or 'ses_fake2/' in args[2]:
             messages += [
                 {'id':'msg_2','type':'assistant','finish':'stop','time':{'created':2,'completed':3},
                  'tokens':{'input':20,'output':5,'cache':{'read':2,'write':0}},
@@ -54,11 +59,26 @@ if args[0] == 'api':
     sys.exit(0)
 assert args[0] == 'run'
 (base / 'prompt').write_text(sys.stdin.read())
+session_id = args[args.index('--session') + 1]
+if session_id == 'ses_fake2':
+    (base / 'writeup_prompt').write_text((base / 'prompt').read_text())
+    if mode == 'budget_writeup_stall': time.sleep(60)
+    if mode == 'budget_writeup_error': sys.exit(3)
 def emit(kind, part=None, **kw):
-    print(json.dumps(dict(type=kind, sessionID='ses_fake', **({'part': part} if part is not None else {}), **kw)), flush=True)
+    print(json.dumps(dict(type=kind, sessionID=session_id, **({'part': part} if part is not None else {}), **kw)), flush=True)
 def step(mid): emit('step_start', {'messageID': mid, 'type': 'step-start'})
 def text(mid, value): emit('text', {'messageID': mid, 'type': 'text', 'text': value})
 def finish(mid, reason): emit('step_finish', {'messageID': mid, 'type': 'step-finish', 'reason': reason, 'tokens': {'input': 10, 'output': 3}})
+if mode.startswith('budget_') and session_id == 'ses_fake':
+    step('msg_1')
+    text('msg_1', 'NARRATIVE MUST NOT BE EVIDENCE')
+    emit('tool_use', {'messageID':'msg_1','id':'tool_1','tool':'read','state':{
+        'status':'completed','input':{'path':'a.py','offset':1},
+        'output':'1: print(1)' + ('\n' + ('x'*50000) if mode == 'budget_long_evidence' else '')}})
+    emit('step_finish', {'messageID':'msg_1','type':'step-finish','reason':'tool-calls',
+                        'tokens':{'input':80,'output':999,'cache':{'read':30,'write':0}}})
+    (base / 'explored').touch()
+    time.sleep(60)
 step('msg_1'); text('msg_1', 'I am still searching.'); finish('msg_1', 'tool-calls')
 if mode in ('sleep', 'abort_failure'):
     child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
@@ -73,6 +93,7 @@ if mode == 'error': emit('error', error={'message': 'permission denied'})
 if mode == 'tool_error': emit('tool_use', {'type': 'tool', 'state': {'status': 'error', 'error': 'permission denied'}})
 if not mode.startswith('replay_'): finish('msg_2', 'length' if mode == 'length' else 'stop')
 if mode == 'nonzero': sys.exit(3)
+if mode == 'complete_hang' and session_id == 'ses_fake': time.sleep(60)
 ''')
     executable.chmod(0o700)
     (tmp_path / 'mode').write_text('success')
@@ -83,9 +104,9 @@ if mode == 'nonzero': sys.exit(3)
     monkeypatch.setattr(worker, 'GPU_LOCK', tmp_path / 'gpu-lock')
     monkeypatch.setattr(worker, 'OPENCODE', str(executable))
     jobs = []
-    def submit(mode='success', timeout=10, scope=None):
+    def submit(mode='success', timeout=10, scope=None, **limits):
         (tmp_path / 'mode').write_text(mode)
-        result = worker.submit('Trace the entry point.', str(repo), scope or ['.'], 'test', timeout)
+        result = worker.submit('Trace the entry point.', str(repo), scope or ['.'], 'test', timeout, **limits)
         jobs.append(result['job_id'])
         return result
     yield worker, submit, tmp_path, repo
@@ -275,7 +296,7 @@ def test_cli_fallback_and_completed_jobs_are_not_cached(runner):
     result = subprocess.run([sys.executable, '-c', code, 'status', second['job_id']],
                             cwd=Path(worker.__file__).parent, capture_output=True, text=True)
     assert result.returncode == 0
-    assert json.loads(result.stdout)['session_id'] == 'ses_fake'
+    assert json.loads(result.stdout)['session_id'] == 'ses_fake2'
 
 
 def test_inflight_dedupe_detects_changed_non_git_scope(runner):
@@ -341,3 +362,159 @@ def test_failure_preserves_bounded_private_diagnostics(runner):
     metadata = json.loads((directory / 'diagnostics.json').read_text())
     assert metadata['stdout_truncated'] is True
     assert 'stdout.tail.log' not in json.dumps(result)
+
+
+
+@pytest.mark.parametrize('mode,limits,reason', [
+    ('budget_steps', {'max_steps':1}, 'max_steps'),
+    ('budget_context', {'max_context_tokens':100}, 'max_context_tokens'),
+    ('budget_time', {'exploration_seconds':1}, 'exploration_seconds'),
+])
+def test_exploration_budget_stops_then_uses_fresh_deny_all_writeup(runner, mode, limits, reason):
+    worker, submit, tmp, _ = runner
+    result = wait(worker, submit(mode, **limits)['job_id'])
+    assert result['status'] == 'partial', result
+    assert result['stop_reason'] == reason
+    assert result['steps'] == 1
+    assert result['observed_context_tokens'] == 110  # latest input+cache, excludes output
+    assert result['exploration_session_id'] == 'ses_fake'
+    assert result['writeup_session_id'] == 'ses_fake2'
+    assert result['phase'] == 'finished'
+    calls = [json.loads(line) for line in (tmp / 'calls.jsonl').read_text().splitlines()]
+    creates = [c for c in calls if c[:3] == ['api','post','/api/session']]
+    assert len(creates) == 2
+    assert json.loads(creates[1][-1])['agent'] == 'build'
+    runs = [c for c in calls if c[0] == 'run']
+    assert runs[1][runs[1].index('--agent') + 1] == 'build'
+    assert json.loads(creates[1][-1])['permissions'] == [{'action':'*','resource':'*','effect':'deny'}]
+    interrupt = next(i for i,c in enumerate(calls) if 'interrupt' in ' '.join(c))
+    assert interrupt < calls.index(creates[1])
+    prompt = (tmp / 'writeup_prompt').read_text()
+    assert '500' in prompt and 'untrusted' in prompt.lower()
+    assert '1: print(1)' in prompt
+    assert 'NARRATIVE MUST NOT BE EVIDENCE' not in prompt
+    assert not worker.GPU_LOCK.exists()
+
+
+@pytest.mark.parametrize('mode', ['budget_writeup_stall', 'budget_writeup_error'])
+def test_writeup_failure_preserves_deterministic_partial_handoff(runner, mode):
+    worker, submit, _, _ = runner
+    result = wait(worker, submit(mode, max_steps=1, writeup_seconds=1)['job_id'])
+    assert result['status'] == 'partial', result
+    assert result['completion_source'] == 'evidence_handoff'
+    report = Path(result['report_path']).read_text()
+    assert 'a.py' in report and '1: print(1)' in report
+    assert 'max_steps' in report and 'partial' in report.lower()
+    assert not worker.GPU_LOCK.exists()
+
+
+def test_evidence_packet_is_bounded_and_marks_truncation(runner):
+    worker, submit, _, _ = runner
+    result = wait(worker, submit('budget_long_evidence', max_steps=1)['job_id'])
+    packet = Path(result['evidence_path'])
+    assert packet.stat().st_size <= 12288
+    assert 'truncated' in packet.read_text().lower()
+    assert packet.stat().st_mode & 0o777 == 0o600
+
+
+def test_budget_abort_uncertain_never_starts_writeup(runner):
+    worker, submit, tmp, _ = runner
+    result = wait(worker, submit('budget_abort_failure', max_steps=1)['job_id'])
+    assert result['status'] == 'cleanup_required'
+    assert result['writeup_session_id'] is None
+    assert (tmp / 'session_count').read_text() == '1'
+    assert worker.GPU_LOCK.exists()
+
+
+def test_cancel_precedes_budget_writeup(runner):
+    worker, submit, tmp, _ = runner
+    job = submit('budget_cancel', exploration_seconds=2)
+    deadline = time.monotonic() + 3
+    while not (tmp / 'explored').exists() and time.monotonic() < deadline: time.sleep(.02)
+    worker.cancel(job['job_id'])
+    result = wait(worker, job['job_id'])
+    assert result['status'] == 'cancelled'
+    assert result['writeup_session_id'] is None
+    assert (tmp / 'session_count').read_text() == '1'
+
+
+@pytest.mark.parametrize('name,value', [('max_steps',0),('max_steps',9),('max_steps',True),('max_context_tokens',0),('max_context_tokens',16001),
+    ('exploration_seconds',121),('writeup_seconds',61),('writeup_seconds',0)])
+def test_budget_limits_are_validated(runner, name, value):
+    worker, _, _, repo = runner
+    with pytest.raises(ValueError):
+        worker.submit('task',str(repo),['.'],'test', **{name:value})
+
+
+def test_normal_fast_report_does_not_start_writeup(runner):
+    worker, submit, tmp, _ = runner
+    result = wait(worker, submit()['job_id'])
+    assert result['status'] == 'completed'
+    assert result['writeup_session_id'] is None
+    assert result['budgets'] == {'max_steps':8,'max_context_tokens':16000,
+                                  'exploration_seconds':120,'writeup_seconds':60}
+    assert (tmp / 'session_count').read_text() == '1'
+
+
+def test_reconcile_ignores_only_our_confirmed_abort_artifacts(runner):
+    worker, _, _, _ = runner
+    messages = [
+        {'type':'user','text':'task'},
+        {'type':'assistant','id':'msg_1','error':{'type':'aborted'},'time':{'created':1,'completed':2},
+         'content':[{'type':'tool','id':'tool_1','name':'read','state':{'status':'error','error':{'type':'aborted'}}}]}]
+    events = worker.Events('ses_fake')
+    worker._observe_messages(events,messages,'task',after_abort=True)
+    assert not events.evidence.entries
+    messages[1]['error'] = {'type':'permission_denied'}
+    with pytest.raises(worker.ProtocolError):
+        worker._observe_messages(events,messages,'task',after_abort=True)
+
+
+def test_repeated_and_older_usage_does_not_inflate_steps_or_regress_context(runner):
+    worker, _, _, _ = runner
+    events = worker.Events('ses_fake')
+    events.observe_usage('msg_1',{'input':20,'output':3})
+    events.observe_usage('msg_2',{'input':30,'output':4,'cache':{'read':10}})
+    events.observe_usage('msg_1',{'input':20,'output':3})
+    assert len(events.step_ids) == 2
+    assert events.tokens['input'] == 50
+    assert events.observed_context_tokens == 40
+
+
+def test_writeup_bounds_long_original_task_and_discloses_truncation(runner):
+    worker, _, tmp, repo = runner
+    (tmp / 'mode').write_text('budget_steps')
+    job = worker.submit('x'*32768,str(repo),['.'],'test',10,max_steps=1)
+    result = wait(worker,job['job_id'])
+    assert result['status'] == 'partial'
+    prompt = (tmp / 'writeup_prompt').read_bytes()
+    assert len(prompt) <= 16384 and b'[truncated]' in prompt
+
+
+
+@pytest.mark.parametrize('mode,limits', [
+    ('budget_api_slow', {'exploration_seconds':6}),
+    ('complete_hang', {'exploration_seconds':1}),
+    ('budget_writeup_verify_slow', {'max_steps':1, 'writeup_seconds':1}),
+])
+def test_phase_expiry_during_api_or_post_completion_stall_keeps_partial(runner, mode, limits):
+    worker, submit, _, _ = runner
+    result = wait(worker,submit(mode,timeout=12,**limits)['job_id'])
+    assert result['status'] == 'partial', result
+    assert result['report_path']
+    assert not worker.GPU_LOCK.exists()
+
+
+def test_evidence_tool_ids_are_scoped_to_assistant_message(runner):
+    worker, _, _, _ = runner
+    evidence = worker.Evidence()
+    def part(message, output):
+        return {'messageID':message,'id':'call_0','tool':'read',
+                'state':{'status':'completed','input':{'path':'a.py'},'output':output}}
+    evidence.add(part('msg_1','first'))
+    evidence.add(part('msg_2','second'))
+    # The session API has an enclosing message ID, not a field on each part.
+    api_part = part('msg_2','second')
+    del api_part['messageID']
+    evidence.add(api_part, message_id='msg_2')
+    assert [entry['output'] for entry in evidence.entries] == ['first','second']

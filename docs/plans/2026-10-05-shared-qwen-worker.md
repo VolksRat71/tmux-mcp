@@ -84,3 +84,41 @@ Activation: reconnect existing tmux MCP clients to discover worker tools.
 The worker.py CLI works immediately. No PR created; orchestrators retain
 acceptance and decisions. Code-editing/test-executing worker profiles remain
 deferred as designed.
+
+## October 6: budgeted exploration and early handoff
+
+Nate approved the bounded follow-up in chat. Exploration now stops at 8
+completed provider steps, 120 seconds or 16k observed context tokens. These
+are ceilings; callers can request lower values. At a cutoff, the runner
+interrupts and confirms its own session inactive, preserves <=12 KiB of
+successful native-tool evidence, and starts a fresh tools-denied build-agent
+write-up with <=60 seconds and a bounded prompt. The ~500-token target is
+instructional; context monitoring can overshoot on a single result. Overall
+timeout/cancellation still take precedence, and cleanup verification may take
+additional bounded API time while the GPU lock remains owned.
+
+Budget stops remain terminal `partial`, including after a successful write-up.
+Stalled write-ups retain a deterministic evidence report. Phase, steps,
+observed context, reason, both session IDs and queue/active timing are visible.
+No shared model/agent profile or 4B worker configuration was changed. The local
+OpenCode instructions received a tools-denied write-up exception while idle.
+
+Validation:
+- Worker tests: 53 passed in 28.08 seconds; full suite: 161 passed in 81.06s.
+- Real MCP initialize/discovery and all four budget-validation routes passed.
+- Independent runtime/guidance review clean after fixing composite tool-call
+  identity, phase API timeout classification and confirmed-own-abort handling.
+- Live job qw-6a7b8ec57393416d92880a72 hit max_steps=1, switched to a fresh
+  write-up session and returned `partial` in 83.773 active seconds. The packet
+  was 4537 bytes, held two successful native reads and explicitly marked
+  truncation. The report cited delivery.py:16/:43-55 and test_delivery.py:14-48
+  accurately. Owner accepted those cited facts; the requested comparison
+  remains incomplete because relevant excerpts were omitted from the packet.
+  "Unread" in the write-up refers to unavailable excerpts, not proof that
+  exploration never opened the full files. No tests were run by Qwen.
+- Final active-session list empty; GPU lock absent. No PR created.
+
+This demonstrates the cutoff/handoff lifecycle, not a matched Claude/Qwen
+speed benchmark. Prepare bounded relevant excerpts for huge logs/transcripts;
+choose narrower follow-ups from partial findings rather than extending a
+slow, overloaded session automatically.

@@ -54,6 +54,8 @@ tmux protocol for agents:
   Codex and their subagents keep ownership of decisions and verification.
   worker_status returns lifecycle, OpenCode session/title, and report path;
   completed means a report was produced, not that its evidence was accepted.
+  partial is a bounded handoff: inspect stop_reason and evidence before a
+  narrower follow-up. Do not automatically extend an exhausted scout job.
   Do not resubmit a queued/running job or read raw progress into your context.
 """
 
@@ -409,7 +411,9 @@ def tmux_input_status(target: str) -> str:
 
 @mcp.tool()
 def worker_submit(task: str, cwd: str, scope: list[str], owner: str,
-                  timeout_seconds: int = 600) -> dict:
+                  timeout_seconds: int = 600, max_steps: int = 8,
+                  max_context_tokens: int = 16000, exploration_seconds: int = 120,
+                  writeup_seconds: int = 60) -> dict:
     """Delegate one bounded read-only task to the shared local Qwen scout.
 
     Specify an absolute working directory, explicit search paths in scope,
@@ -419,8 +423,13 @@ def worker_submit(task: str, cwd: str, scope: list[str], owner: str,
     Returns a job ID immediately; check worker_status, never submit copies.
     Local inference waits for the shared GPU lock. Job state is separate from
     tmux message delivery. Orchestrators must verify the final evidence.
+    Default exploration stops at 8 steps, 120 seconds or 16k observed context
+    tokens. A fresh tools-denied session has up to 60 seconds to write up
+    bounded evidence; a partial report remains available if that stalls.
+    Context is an observed stop threshold, not a pre-generation token cap.
     """
-    return worker.submit(task, cwd, scope, owner, timeout_seconds)
+    return worker.submit(task, cwd, scope, owner, timeout_seconds, max_steps,
+                         max_context_tokens, exploration_seconds, writeup_seconds)
 
 
 @mcp.tool()

@@ -150,7 +150,10 @@ The optional runner uses the installed OpenCode V2 service and local
 the title `qwen-worker:<owner> [<short-id>]` and session ID let you find the work
 in OpenCode.
 Status includes owner, scope, effective tools, elapsed time, revision/dirty
-state, available token counts and final report path. No raw progress is returned
+state, available token counts and final report path. It also exposes phase,
+exploration steps, observed context and the reason exploration stopped.
+Queue time and active elapsed time are reported separately.
+No raw progress is returned
 to the calling agent. It does not estimate premium tokens saved.
 
 ```sh
@@ -170,6 +173,39 @@ not automatically cached or reused. Queued jobs fail if their scope changes
 before execution. Check the
 existing ID instead of resubmitting. Manual reuse requires checking relevant
 content and file inventory, not just HEAD.
+
+Exploration defaults to 8 provider steps, 120 seconds and a 16,000-token
+observed context threshold. The first reached limit stops exploration. The
+runner interrupts its exact session and verifies inactivity, then gives a
+fresh session up to 60 seconds to write up a private evidence packet of at
+most 12 KiB. That session has all tools denied. The requested write-up is
+about 500 tokens; this is a prompt target, not a provider-enforced token cap.
+The active-time allowance is exploration plus write-up; the existing timeout
+still includes queue time and can end a job sooner.
+
+Optional `worker_submit`/CLI JSON parameters are `max_steps=8`,
+`max_context_tokens=16000`, `exploration_seconds=120` and `writeup_seconds=60`.
+These are also the maximum values in this iteration; callers can lower them.
+Increasing the ceilings requires a deliberate runner change and verification.
+Steps count distinct completed provider turns. Observed context is the latest
+input plus cache-read/cache-write token counts, excluding output; it is not
+cumulative usage or the number of files read. A large result can overshoot the observed
+context threshold before the runner stops it; it is not a strict input-token
+ceiling. Keep starting inputs bounded.
+
+A budget stop returns terminal `partial`, with its stop reason, evidence path
+and report path. Successful native tool results are preserved as explicitly
+bounded excerpts; progress narration is not evidence. If the write-up stalls,
+the runner retains a deterministic evidence handoff instead of losing those
+results. `partial` does not establish task completion. Inspect the gaps and
+choose a narrower follow-up when useful; exhausted jobs are never extended
+automatically. Cancellation, overall timeout and uncertain server cleanup
+retain their existing behavior and precedence.
+
+For large chat histories or logs, first identify matching files and extract
+short relevant ranges into a scoped input file. Avoid giving the scout whole
+JSONL transcripts with enormous records. Read-only scouting cannot prepare
+those shell-derived inputs itself; the authorized orchestrator supplies them.
 
 Sessions default-deny capabilities and allow native reads only within the
 declared scope. Narrow scopes use `read`, which also lists directories.
